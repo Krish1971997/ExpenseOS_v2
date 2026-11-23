@@ -1,0 +1,498 @@
+package com.expenseos.util;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+public class AppConfig {
+
+    private static final String PREF_NAME = "expenseos_config";
+
+    public static final String KEY_DB_URL = "DB_URL";
+    public static final String KEY_DB_USER = "DB_USER";
+    public static final String KEY_DB_PASSWORD = "DB_PASSWORD";
+    public static final String KEY_GMAIL_FROM = "GMAIL_FROM";
+    public static final String KEY_GMAIL_APP_PASS = "GMAIL_APP_PASS";
+    public static final String KEY_SCHEDULER_ALERT_EMAIL = "scheduler.alert.email";
+
+    // ── AI Assistant keys — one key/model PER provider so switching
+    // providers never overwrites another provider's saved credentials ──
+    public static final String KEY_AI_PROVIDER = "ai.provider";
+    private static final String KEY_AI_KEY_PREFIX = "ai.key.";
+    private static final String KEY_AI_MODEL_PREFIX = "ai.model.";
+
+    public static final String PROVIDER_OPENAI = "openai";
+    public static final String PROVIDER_GEMINI = "gemini";
+    public static final String PROVIDER_GROK = "grok";
+    public static final String PROVIDER_CLAUDE = "claude";
+    public static final String PROVIDER_GENSPARK = "genspark";
+
+    public static final String KEY_ZOHO_CLIENT_ID = "zoho.client.id";
+    public static final String KEY_ZOHO_CLIENT_SECRET = "zoho.client.secret";
+    public static final String KEY_ZOHO_REFRESH_TOKEN = "zoho.refresh.token";
+    public static final String KEY_WORKDRIVE_FOLDER_ID = "workdrive.main.folder.id";
+    public static final String KEY_IMPORT_EXCEL_FILE_NAME = "import.excel.file.name";
+    public static final String DEFAULT_IMPORT_EXCEL_FILE_NAME = "Import Transactions.zsheetlnk";
+    public static final String KEY_BACKUP_HOUR = "backup.schedule.hour";
+    public static final String KEY_BACKUP_MINUTE = "backup.schedule.minute";
+    public static final String KEY_SESSION_TIMEOUT = "session.timeout";
+    public static final String KEY_ACTIVE_BOOK_ID = "active_book_id";
+    public static final String KEY_ACTIVE_BOOK_NAME = "active_book_name";
+    public static final String KEY_ALARM_VOLUME_RAMP_SEC = "alarm.volume.ramp.sec";
+    public static final String KEY_ALARM_VIBRATE = "alarm.vibrate";
+
+    // ── Odoo Timesheet ──
+    public static final String KEY_ODOO_URL = "odoo.url";
+    public static final String KEY_ODOO_DB = "odoo.db";
+    public static final String KEY_ODOO_USER = "odoo.user";
+    public static final String KEY_ODOO_APIKEY = "odoo.apikey";
+
+    // DB: verify the server certificate chain and host name (sslmode=verify-full)
+    public static final String KEY_STRICT_TLS = "db.strict.tls";
+
+    // ── Supabase Storage (attachment files) ──
+    public static final String KEY_SUPABASE_URL = "supabase.url";
+    public static final String KEY_SUPABASE_BUCKET = "supabase.bucket";
+    public static final String KEY_SUPABASE_ANON_KEY = "supabase.anon.key";
+    public static final String KEY_SUPABASE_EMAIL = "supabase.email";
+    public static final String KEY_SUPABASE_PASSWORD = "supabase.password";
+    public static final String DEFAULT_SUPABASE_BUCKET = "ExpenseOS_FileStorage";
+
+    private final SharedPreferences prefs;
+    private static AppConfig instance;
+
+    AppConfig(Context ctx) { // package-private: AiConfigStore legacy migration reuses slot defaults
+        if (ctx == null) {
+            prefs = null;
+            return;
+        }
+        prefs = ctx.getApplicationContext()
+                .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+        migrateSecrets(ctx);
+    }
+
+    /**
+     * Reads a string pref. Plain values pass through unchanged; "ks1:" values are decrypted
+     * (up to 3 layers, in case a value was wrapped more than once). Decrypt failure -> "".
+     */
+    private String plain(String key, String def) {
+        String v = prefs.getString(key, def);
+        for (int i = 0; i < 3 && SecretStore.isEncrypted(v); i++) v = SecretStore.decrypt(v);
+        return v == null ? def : v;
+    }
+
+    private String secret(String key) {
+        return plain(key, "");
+    }
+
+    /**
+     * Idempotent: pulls secrets from the old duplicate prefs file, encrypts every plaintext secret, deletes the duplicates.
+     */
+    private void migrateSecrets(Context ctx) {
+        try {
+            SharedPreferences legacy = ctx.getApplicationContext()
+                    .getSharedPreferences("expenseos_prefs", Context.MODE_PRIVATE);
+            SharedPreferences.Editor e = prefs.edit();
+            if (prefs.getString(KEY_DB_URL, "").isEmpty() && !legacy.getString("db_url", "").isEmpty()) {
+                e.putString(KEY_DB_URL, legacy.getString("db_url", ""));
+                e.putString(KEY_DB_USER, legacy.getString("db_user", ""));
+                e.putString(KEY_DB_PASSWORD, legacy.getString("db_pass", ""));
+            }
+            if (prefs.getString(KEY_GMAIL_APP_PASS, "").isEmpty() && !legacy.getString("gmail_pass", "").isEmpty())
+                e.putString(KEY_GMAIL_APP_PASS, legacy.getString("gmail_pass", ""));
+            e.apply();
+
+            e = prefs.edit();
+            for (java.util.Map.Entry<String, ?> en : prefs.getAll().entrySet()) {
+                String k = en.getKey();
+                boolean isSecret = k.equals(KEY_DB_URL) || k.equals(KEY_DB_USER) || k.equals(KEY_DB_PASSWORD)
+                        || k.equals(KEY_GMAIL_APP_PASS) || k.equals(KEY_ZOHO_CLIENT_SECRET)
+                        || k.equals(KEY_ZOHO_REFRESH_TOKEN) || k.equals(KEY_ODOO_APIKEY)
+                        || k.equals(KEY_SUPABASE_ANON_KEY) || k.equals(KEY_SUPABASE_EMAIL)
+                        || k.equals(KEY_SUPABASE_PASSWORD)
+                        || k.startsWith(KEY_AI_KEY_PREFIX);
+                if (isSecret && en.getValue() instanceof String v) {
+                    if (!v.isEmpty() && !SecretStore.isEncrypted(v))
+                        e.putString(k, SecretStore.encrypt(v));
+                }
+            }
+            e.apply();
+
+            legacy.edit().remove("db_url").remove("db_user").remove("db_pass").remove("gmail_pass").apply();
+        } catch (Exception ignored) {
+        }
+    }
+
+    public static AppConfig get(Context ctx) {
+        if (instance == null) instance = new AppConfig(ctx);
+        return instance;
+    }
+
+    // ── Getters ──────────────────────────────────────────────
+    public String getDbUrl() {
+        return secret(KEY_DB_URL);
+    }
+
+    public String getDbUser() {
+        return secret(KEY_DB_USER);
+    }
+
+    public String getDbPassword() {
+        return secret(KEY_DB_PASSWORD);
+    }
+
+    public String getGmailFrom() {
+        return plain(KEY_GMAIL_FROM, "");
+    }
+
+    public String getGmailAppPass() {
+        return secret(KEY_GMAIL_APP_PASS);
+    }
+
+    public String getSchedulerAlertEmail() {
+        return plain(KEY_SCHEDULER_ALERT_EMAIL, "");
+    }
+
+    public String getAiKey(String provider) {
+        return secret(KEY_AI_KEY_PREFIX + provider);
+    }
+
+    public String getAiModel(String provider) {
+        String m = plain(KEY_AI_MODEL_PREFIX + provider, "");
+        return m.isEmpty() ? defaultModelFor(provider) : m;
+    }
+
+    public String getAiProvider() {
+        String p = plain(KEY_AI_PROVIDER, PROVIDER_GEMINI);
+        return p.isEmpty() ? PROVIDER_GEMINI : p;
+    }
+
+    String defaultModelFor(String provider) { // package-private: reused by legacy migration
+        return switch (provider) {
+            case PROVIDER_OPENAI -> "gpt-4o-mini";
+            case PROVIDER_GROK -> "grok-2-latest";
+            case PROVIDER_CLAUDE -> "claude-3-5-sonnet-20241022";
+            case PROVIDER_GENSPARK -> "genspark-instruct";
+            default -> "gemini-2.0-flash";
+        };
+    }
+
+    // Kept for source compat with any older callers — routes to the
+    // currently selected provider's key/model.
+    public String getOpenAiApiKey() {
+        return getAiKey(getAiProvider());
+    }
+
+    public String getOpenAiModel() {
+        return getAiModel(getAiProvider());
+    }
+
+    public String getZohoClientId() {
+        return plain(KEY_ZOHO_CLIENT_ID, "");
+    }
+
+    public String getZohoClientSecret() {
+        return secret(KEY_ZOHO_CLIENT_SECRET);
+    }
+
+    public String getZohoRefreshToken() {
+        return secret(KEY_ZOHO_REFRESH_TOKEN);
+    }
+
+    public String getWorkdriveFolderId() {
+        return plain(KEY_WORKDRIVE_FOLDER_ID, "");
+    }
+
+    /**
+     * Excel file used by Bulk Import (lives in the same WorkDrive folder as backups).
+     * Blank -> default; ".xlsx" is appended if missing; illegal file-name chars become "_".
+     */
+    /**
+     * First configured file (kept for old callers).
+     */
+    public String getImportExcelFileName() {
+        return getImportExcelFileNames().get(0);
+    }
+
+    /**
+     * All files: comma / semicolon / newline separated in the same Config field.
+     */
+    public java.util.List<String> getImportExcelFileNames() {
+        String raw = plain(KEY_IMPORT_EXCEL_FILE_NAME, DEFAULT_IMPORT_EXCEL_FILE_NAME);
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        if (raw != null) for (String part : raw.split("[,;\\n]")) {
+            String n = part.trim().replaceAll("[\\\\/:*?\"<>|]", "_");
+            if (!n.isEmpty()) out.add(n);
+        }
+        if (out.isEmpty()) out.add(DEFAULT_IMPORT_EXCEL_FILE_NAME);
+        return new java.util.ArrayList<>(out);
+    }
+
+    /**
+     * Raw text exactly as saved (may hold several comma-separated names), for the Config screen.
+     */
+    public String getImportExcelFileNamesRaw() {
+        return plain(KEY_IMPORT_EXCEL_FILE_NAME, DEFAULT_IMPORT_EXCEL_FILE_NAME);
+    }
+
+    public int getBackupHour() {
+        return prefs.getInt(KEY_BACKUP_HOUR, 0);
+    }
+
+    public int getBackupMinute() {
+        return prefs.getInt(KEY_BACKUP_MINUTE, 0);
+    }
+
+    public int getSessionTimeout() {
+        return prefs.getInt(KEY_SESSION_TIMEOUT, 60);
+    }
+
+    /**
+     * Seconds the alarm takes to reach full volume; 0 = off (full volume immediately).
+     */
+    public int getAlarmVolumeRampSeconds() {
+        return prefs.getInt(KEY_ALARM_VOLUME_RAMP_SEC, 30);
+    }
+
+    public boolean isAlarmVibrationEnabled() {
+        return prefs.getBoolean(KEY_ALARM_VIBRATE, true);
+    }
+
+    public int getActiveBookId() {
+        return prefs.getInt(KEY_ACTIVE_BOOK_ID, 1);
+    }
+
+    public String getActiveBookName() {
+        return plain(KEY_ACTIVE_BOOK_NAME, "General");
+    }
+
+    public String getOdooUrl() {
+        return plain(KEY_ODOO_URL, "").trim();
+    }
+
+    public String getOdooDb() {
+        return plain(KEY_ODOO_DB, "").trim();
+    }
+
+    public String getOdooUser() {
+        return plain(KEY_ODOO_USER, "").trim();
+    }
+
+    public String getOdooApiKey() {
+        return secret(KEY_ODOO_APIKEY).trim();
+    }
+
+    /**
+     * If the cashbook name contains "credit card" (case-insensitive), the chosen
+     * payment type must itself contain "card" — e.g. a book named "HDFC Credit Card"
+     * shouldn't accept a Cash/UPI payment type. Returns null when valid, else a
+     * user-facing error message.
+     */
+    public static String validatePaymentTypeForBook(String bookName, String paymentType) {
+        if (bookName == null || paymentType == null) return null;
+        boolean isCardBook = bookName.toLowerCase(java.util.Locale.ROOT).contains("credit card");
+        if (!isCardBook) return null;
+        boolean isCardPayment = paymentType.toLowerCase(java.util.Locale.ROOT).contains("card");
+        if (isCardPayment) return null;
+        return "\"" + bookName + "\" is a Credit Card book — payment type must be a card (e.g. \""
+                + bookName + "\"), not \"" + paymentType + "\".";
+    }
+
+    // ── Setters ──────────────────────────────────────────────
+    public void setDb(String url, String user, String pass) {
+        prefs.edit().putString(KEY_DB_URL, SecretStore.encrypt(url)).putString(KEY_DB_USER, SecretStore.encrypt(user))
+                .putString(KEY_DB_PASSWORD, SecretStore.encrypt(pass)).apply();
+    }
+
+    public void setGmail(String from, String appPass) {
+        prefs.edit().putString(KEY_GMAIL_FROM, from).putString(KEY_GMAIL_APP_PASS, SecretStore.encrypt(appPass)).apply();
+    }
+
+    public void setSchedulerAlertEmail(String email) {
+        prefs.edit().putString(KEY_SCHEDULER_ALERT_EMAIL, email).apply();
+    }
+
+    // Saves this key/model under the given provider's own slot, and makes
+    // that provider the active one — switching providers later never
+    // clobbers another provider's saved credentials.
+    public void setAiConfig(String apiKey, String model, String provider) {
+        String p = provider == null || provider.isBlank() ? PROVIDER_GEMINI : provider;
+        prefs.edit()
+                .putString(KEY_AI_KEY_PREFIX + p, SecretStore.encrypt(apiKey))
+                .putString(KEY_AI_MODEL_PREFIX + p, model == null || model.isBlank() ? defaultModelFor(p) : model)
+                .putString(KEY_AI_PROVIDER, p)
+                .apply();
+    }
+
+    public void setZoho(String clientId, String secret, String refreshToken, String folderId) {
+        prefs.edit()
+                .putString(KEY_ZOHO_CLIENT_ID, clientId)
+                .putString(KEY_ZOHO_CLIENT_SECRET, SecretStore.encrypt(secret))
+                .putString(KEY_ZOHO_REFRESH_TOKEN, SecretStore.encrypt(refreshToken))
+                .putString(KEY_WORKDRIVE_FOLDER_ID, folderId)
+                .apply();
+    }
+
+    public void setImportExcelFileName(String fileName) {
+        prefs.edit().putString(KEY_IMPORT_EXCEL_FILE_NAME, fileName == null ? "" : fileName.trim()).apply();
+    }
+
+    public void setBackupSchedule(int hour, int minute) {
+        prefs.edit().putInt(KEY_BACKUP_HOUR, hour).putInt(KEY_BACKUP_MINUTE, minute).apply();
+    }
+
+    public void setSessionTimeout(int minutes) {
+        prefs.edit().putInt(KEY_SESSION_TIMEOUT, minutes).apply();
+    }
+
+    public void setAlarmVolumeRampSeconds(int seconds) {
+        prefs.edit().putInt(KEY_ALARM_VOLUME_RAMP_SEC, Math.max(0, seconds)).apply();
+    }
+
+    public void setAlarmVibrationEnabled(boolean on) {
+        prefs.edit().putBoolean(KEY_ALARM_VIBRATE, on).apply();
+    }
+
+    public int getPreAlarmMinutes() {
+        return prefs.getInt("pre_alarm_minutes", 30);
+    } // 0 = off
+
+    public void setPreAlarmMinutes(int m) {
+        prefs.edit().putInt("pre_alarm_minutes", m).apply();
+    }
+
+    /**
+     * "Off" / "30 minutes before" — for the Config row summary.
+     */
+    public static String preAlarmLabel(int m) {
+        return m <= 0 ? "Off" : m + " minutes before";
+    }
+
+    public static void showPreAlarmDialog(android.app.Activity a, Runnable onDone) {
+        com.expenseos.util.AppConfig cfg = com.expenseos.util.AppConfig.get(a);
+        String[] opts = {"Off", "15 minutes", "30 minutes", "60 minutes", "Custom…"};
+        int[] vals = {0, 15, 30, 60, -1};
+        new androidx.appcompat.app.AlertDialog.Builder(a)
+                .setTitle("Pre-alarm notification")
+                .setItems(opts, (d, which) -> {
+                    if (vals[which] >= 0) {
+                        cfg.setPreAlarmMinutes(vals[which]);
+                        com.expenseos.scheduler.TaskAlarmRescheduler.rescheduleAllAsync(a);
+                        if (onDone != null) onDone.run();
+                        return;
+                    }
+                    android.widget.EditText et = new android.widget.EditText(a);
+                    et.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+                    et.setHint("Minutes before (1–720)");
+                    new androidx.appcompat.app.AlertDialog.Builder(a)
+                            .setTitle("Custom minutes")
+                            .setView(et)
+                            .setPositiveButton("Save", (d2, w) -> {
+                                try {
+                                    int m = Integer.parseInt(et.getText().toString().trim());
+                                    if (m < 1 || m > 720) throw new NumberFormatException();
+                                    cfg.setPreAlarmMinutes(m);
+                                    com.expenseos.scheduler.TaskAlarmRescheduler.rescheduleAllAsync(a);
+                                    if (onDone != null) onDone.run();
+                                } catch (NumberFormatException ex) {
+                                    android.widget.Toast.makeText(a, "Enter 1–720", android.widget.Toast.LENGTH_SHORT).show();
+                                }
+                            })
+                            .setNegativeButton("Cancel", null).show();
+                })
+                .show();
+    }
+
+    public void setActiveBook(int id, String name) {
+        prefs.edit().putInt(KEY_ACTIVE_BOOK_ID, id).putString(KEY_ACTIVE_BOOK_NAME, name).apply();
+    }
+
+    public void setOdoo(String url, String db, String user, String apiKey) {
+        prefs.edit()
+                .putString(KEY_ODOO_URL, url)
+                .putString(KEY_ODOO_DB, db)
+                .putString(KEY_ODOO_USER, user)
+                .putString(KEY_ODOO_APIKEY, SecretStore.encrypt(apiKey))
+                .apply();
+    }
+
+    public String getSupabaseUrl() {
+        String u = plain(KEY_SUPABASE_URL, "").trim();
+        // Keep scheme + host only: the dashboard shows ".../rest/v1", but Auth and Storage live at the project root
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("^(https?://[^/]+)").matcher(u);
+        return m.find() ? m.group(1) : u;
+    }
+
+    public String getSupabaseBucket() {
+        String b = plain(KEY_SUPABASE_BUCKET, "").trim();
+        return b.isEmpty() ? DEFAULT_SUPABASE_BUCKET : b;
+    }
+
+    public String getSupabaseAnonKey() {
+        return secret(KEY_SUPABASE_ANON_KEY).trim();
+    }
+
+    public String getSupabaseEmail() {
+        return secret(KEY_SUPABASE_EMAIL).trim();
+    }
+
+    public String getSupabasePassword() {
+        return secret(KEY_SUPABASE_PASSWORD);
+    }
+
+    public boolean isSupabaseConfigured() {
+        return !getSupabaseUrl().isEmpty() && !getSupabaseAnonKey().isEmpty()
+                && !getSupabaseEmail().isEmpty() && !getSupabasePassword().isEmpty();
+    }
+
+    public void setSupabase(String url, String bucket, String anonKey, String email, String password) {
+        prefs.edit()
+                .putString(KEY_SUPABASE_URL, url == null ? "" : url.trim())
+                .putString(KEY_SUPABASE_BUCKET, bucket == null ? "" : bucket.trim())
+                .putString(KEY_SUPABASE_ANON_KEY, SecretStore.encrypt(anonKey == null ? "" : anonKey.trim()))
+                .putString(KEY_SUPABASE_EMAIL, SecretStore.encrypt(email == null ? "" : email.trim()))
+                .putString(KEY_SUPABASE_PASSWORD, SecretStore.encrypt(password == null ? "" : password))
+                .apply();
+        com.expenseos.cloud.SupabaseStorage.reset();
+    }
+
+    /**
+     * Non-secret part only (restored from the cloud app_config table).
+     */
+    public void setSupabasePublic(String url, String bucket) {
+        prefs.edit()
+                .putString(KEY_SUPABASE_URL, url == null ? "" : url.trim())
+                .putString(KEY_SUPABASE_BUCKET, bucket == null ? "" : bucket.trim())
+                .apply();
+        com.expenseos.cloud.SupabaseStorage.reset();
+    }
+
+    public boolean isStrictTls() {
+        return prefs.getBoolean(KEY_STRICT_TLS, false);
+    }
+
+    public void setStrictTls(boolean on) {
+        prefs.edit().putBoolean(KEY_STRICT_TLS, on).apply();
+    }
+
+    public boolean isConfigured() {
+        String url = getDbUrl();
+        return url != null && !url.isEmpty();
+    }
+
+    /** Remove downloaded credentials and API keys; preserve local data and user preferences. */
+    public void clearSecrets() {
+        SharedPreferences.Editor e = prefs.edit();
+        for (String key : prefs.getAll().keySet()) {
+            if (KEY_DB_URL.equals(key) || KEY_DB_USER.equals(key) || KEY_DB_PASSWORD.equals(key)
+                    || KEY_GMAIL_APP_PASS.equals(key) || KEY_ZOHO_CLIENT_SECRET.equals(key)
+                    || KEY_ZOHO_REFRESH_TOKEN.equals(key) || KEY_ODOO_APIKEY.equals(key)
+                    || KEY_SUPABASE_ANON_KEY.equals(key) || KEY_SUPABASE_EMAIL.equals(key)
+                    || KEY_SUPABASE_PASSWORD.equals(key) || key.startsWith(KEY_AI_KEY_PREFIX)
+                    || key.startsWith("ai.config")) {
+                e.remove(key);
+            }
+        }
+        e.apply();
+        com.expenseos.cloud.SupabaseStorage.reset();
+    }
+}

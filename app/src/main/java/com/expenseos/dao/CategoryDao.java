@@ -1,0 +1,150 @@
+package com.expenseos.dao;
+
+import android.content.ContentValues;
+import android.content.Context;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+
+import com.expenseos.db.LocalDB;
+import com.expenseos.model.Category;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class CategoryDao {
+    private final Context ctx;
+    private final LocalDB helper;
+    private final SQLiteDatabase db;
+
+    public CategoryDao(Context ctx) {
+        this.ctx = ctx;
+        helper = LocalDB.getInstance(ctx);
+        db = helper.getWritableDatabase();
+    }
+
+    /**
+     * Common categories (book_id IS NULL) + book-specific categories
+     */
+    public List<Category> findByType(String type, Integer bookId) {
+        String sql = "SELECT id, name, type, book_id FROM categories " +
+                "WHERE type=? AND (book_id IS NULL" +
+                (bookId != null ? " OR book_id=" + bookId : "") +
+                ") ORDER BY book_id IS NOT NULL, id";
+        List<Category> list = new ArrayList<>();
+        Cursor c = db.rawQuery(sql, new String[]{type});
+        while (c.moveToNext()) {
+            int bId = c.getInt(3);
+            Integer bIdVal = c.isNull(3) ? null : bId;
+            list.add(new Category(c.getInt(0), c.getString(1), c.getString(2), bIdVal));
+        }
+        c.close();
+        return list;
+    }
+
+    /**
+     * Backward compat — common categories only
+     */
+    public List<Category> findByType(String type) {
+        return findByType(type, null);
+    }
+
+    /**
+     * Insert with optional bookId (null = common)
+     */
+    public void insert(String name, String type, Integer bookId) {
+        long id = helper.getNextId("categories");
+        ContentValues cv = new ContentValues();
+        cv.put("id", id);
+        cv.put("name", name.trim());
+        cv.put("type", type);
+        if (bookId != null) cv.put("book_id", bookId);
+        else cv.putNull("book_id");
+        db.insertWithOnConflict("categories", null, cv, SQLiteDatabase.CONFLICT_IGNORE);
+    }
+
+    public void insert(String name, String type) {
+        insert(name, type, null);
+    }
+
+    // insert() method-க்கு கீழே சேருங்க
+
+    /**
+     * Existing categories with the same name (case-insensitive), same
+     * type, in overlapping scope — used to block/flag duplicates before
+     * they're created. Same reasoning as KeywordMappingDao.findByKeyword().
+     */
+    public List<Category> findByName(String name, String type, Integer bookId, Integer excludeId) {
+        String sql = "SELECT id, name, type, book_id FROM categories " +
+                "WHERE LOWER(name)=LOWER(?) AND type=? " +
+                "AND (book_id IS NULL" + (bookId != null ? " OR book_id=" + bookId : "") + ")" +
+                (excludeId != null ? " AND id<>" + excludeId : "");
+        List<Category> list = new ArrayList<>();
+        try (Cursor c = db.rawQuery(sql, new String[]{name.trim(), type})) {
+            while (c.moveToNext()) {
+                Integer bId = c.isNull(3) ? null : c.getInt(3);
+                list.add(new Category(c.getInt(0), c.getString(1), c.getString(2), bId));
+            }
+        }
+        return list;
+    }
+
+    public void update(int id, String newName) {
+        ContentValues cv = new ContentValues();
+        cv.put("name", newName.trim());
+        db.update("categories", cv, "id=?", new String[]{String.valueOf(id)});
+    }
+
+    /**
+     * Change a category's scope after creation — Common (bookId=null) <->
+     * book-specific (bookId=that book). Existing transactions keep pointing
+     * at the same category id, so nothing about mapped transactions changes;
+     * only which cashbook(s) the category shows up in going forward.
+     */
+    public void updateScope(int id, Integer bookId) {
+        ContentValues cv = new ContentValues();
+        if (bookId != null) cv.put("book_id", bookId);
+        else cv.putNull("book_id");
+        db.update("categories", cv, "id=?", new String[]{String.valueOf(id)});
+    }
+
+    public void delete(int id) {
+        try (Cursor c = db.rawQuery("SELECT name, type, book_id FROM categories WHERE id=?",
+                new String[]{String.valueOf(id)})) {
+            if (c.moveToFirst()) {
+                Integer catBookId = c.isNull(2) ? null : c.getInt(2);
+                org.json.JSONObject row = new org.json.JSONObject();
+                try {
+                    row.put("name", c.getString(0));
+                    row.put("type", c.getString(1));
+                    row.put("book_id", catBookId == null ? org.json.JSONObject.NULL : catBookId);
+
+                    org.json.JSONArray txnIds = new org.json.JSONArray();
+                    try (Cursor tc = db.rawQuery("SELECT id FROM transactions WHERE category_id=?",
+                            new String[]{String.valueOf(id)})) {
+                        while (tc.moveToNext()) txnIds.put(tc.getInt(0));
+                    }
+                    row.put("unlinked_transaction_ids", txnIds);
+                } catch (org.json.JSONException ignored) {
+                }
+                new RecycleBinDao(ctx).put("categories", id, catBookId, row);
+            }
+        }
+        db.execSQL("UPDATE transactions SET category_id=NULL WHERE category_id=?", new Object[]{id});
+        db.delete("categories", "id=?", new String[]{String.valueOf(id)});
+    }
+
+    /**
+     * All categories of this type, across every book (used by "All Transactions" filters).
+     */
+    public List<Category> findAllByType(String type) {
+        String sql = "SELECT id, name, type, book_id FROM categories WHERE type=? ORDER BY id";
+        List<Category> list = new ArrayList<>();
+        try (Cursor c = db.rawQuery(sql, new String[]{type})) {
+            while (c.moveToNext()) {
+                Integer bId = c.isNull(3) ? null : c.getInt(3);
+                list.add(new Category(c.getInt(0), c.getString(1), c.getString(2), bId));
+            }
+        }
+        return list;
+    }
+}

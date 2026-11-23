@@ -1,0 +1,105 @@
+package com.expenseos.dao;
+
+import android.content.ContentValues;
+import android.content.Context;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+
+import com.expenseos.db.LocalDB;
+import com.expenseos.model.ColumnDefinition;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Android/SQLite port of the web ColumnDefinitionDAO.
+ * Assumes a UNIQUE(col_key, type) index on column_definitions, matching the
+ * original ON CONFLICT (col_key, type) DO NOTHING behaviour via CONFLICT_IGNORE.
+ */
+public class ColumnDefinitionDao {
+
+    private final Context ctx;
+    private final LocalDB helper;
+    private final SQLiteDatabase db;
+
+    public ColumnDefinitionDao(Context ctx) {
+        this.ctx = ctx;
+        helper = LocalDB.getInstance(ctx);
+        db = helper.getWritableDatabase();
+    }
+
+    public List<ColumnDefinition> findByType(String type) {
+        String sql = "SELECT id, col_name, col_key, type FROM column_definitions WHERE type=? ORDER BY id";
+        List<ColumnDefinition> list = new ArrayList<>();
+        try (Cursor c = db.rawQuery(sql, new String[]{type})) {
+            while (c.moveToNext())
+                list.add(new ColumnDefinition(
+                        c.getInt(c.getColumnIndexOrThrow("id")),
+                        c.getString(c.getColumnIndexOrThrow("col_name")),
+                        c.getString(c.getColumnIndexOrThrow("col_key")),
+                        c.getString(c.getColumnIndexOrThrow("type"))));
+        }
+        return list;
+    }
+
+    public void insert(String colName, String type) {
+        String colKey = colName.trim().toLowerCase().replaceAll("[^a-z0-9]+", "_").replaceAll("^_|_$", "");
+        long id = helper.getNextId("column_definitions");
+        ContentValues cv = new ContentValues();
+        cv.put("id", id);
+        cv.put("col_name", colName.trim());
+        cv.put("col_key", colKey);
+        cv.put("type", type);
+        db.insertWithOnConflict("column_definitions", null, cv, SQLiteDatabase.CONFLICT_IGNORE);
+    }
+
+    // Renames the display label only — col_key is deliberately left
+    // unchanged, since TransactionDao looks up existing custom values by
+    // col_key. Changing it on rename would orphan every value already
+    // saved against this field.
+    public void update(int id, String newName) {
+        ContentValues cv = new ContentValues();
+        cv.put("col_name", newName.trim());
+        db.update("column_definitions", cv, "id = ?", new String[]{String.valueOf(id)});
+    }
+
+    public void delete(int id) {
+        try (Cursor c = db.rawQuery("SELECT col_name, col_key, type FROM column_definitions WHERE id=?",
+                new String[]{String.valueOf(id)})) {
+            if (c.moveToFirst()) {
+                org.json.JSONObject row = new org.json.JSONObject();
+                try {
+                    row.put("col_name", c.getString(0));
+                    row.put("col_key", c.getString(1));
+                    row.put("type", c.getString(2));
+
+                    // Every transaction's saved value for this field — hard
+                    // deleted below, so snapshot each row to restore alongside it.
+                    org.json.JSONArray valuesArr = new org.json.JSONArray();
+                    try (Cursor vc = db.rawQuery(
+                            "SELECT id, transaction_id, value FROM transaction_custom_values WHERE col_def_id=?",
+                            new String[]{String.valueOf(id)})) {
+                        while (vc.moveToNext()) {
+                            org.json.JSONObject vObj = new org.json.JSONObject();
+                            vObj.put("id", vc.getInt(0));
+                            vObj.put("transaction_id", vc.getInt(1));
+                            vObj.put("value", vc.isNull(2) ? org.json.JSONObject.NULL : vc.getString(2));
+                            valuesArr.put(vObj);
+                        }
+                    }
+                    row.put("custom_values_data", valuesArr);
+                } catch (org.json.JSONException ignored) {
+                }
+                new RecycleBinDao(ctx).put("column_definitions", id, row);
+            }
+        }
+        db.beginTransaction();
+        try {
+            db.delete("transaction_custom_values", "col_def_id = ?", new String[]{String.valueOf(id)});
+            db.delete("column_definitions", "id = ?", new String[]{String.valueOf(id)});
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+    }
+}

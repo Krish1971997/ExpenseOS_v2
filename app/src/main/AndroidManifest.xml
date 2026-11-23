@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature
+        android:name="android.hardware.telephony"
+        android:required="false" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Only needed for the legacy pre-scoped-storage Downloads save path
+     (API 26-28) in DownloadsSaver — maxSdkVersion so it's a no-op
+     (and doesn't show in the Play Store permission list) on API 29+,
+     where MediaStore.Downloads is used instead. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+
+    <!-- Daily 9 PM reminder notification -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Package visibility: lets the app/SDK detect the Zoho OneAuth app (Android 11+) -->
+    <queries>
+        <package android:name="com.zoho.accounts.oneauth" />
+    </queries>
+
+    <application
+        android:name=".ExpenseOSApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.ExpenseOS"
+        android:usesCleartextTraffic="true">
+
+        <!-- Launch: Book Selector — Splash theme shows the logo instantly
+             on cold start (loadBooks() DB query + scheduler init in
+             onCreate() are slow enough to otherwise flash a blank white
+             screen); MainActivity switches back to the normal theme in
+             onCreate() before setContentView(). -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.ExpenseOS.Splash">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Legacy shell retained while the replacement shell is validated. -->
+        <activity
+            android:name=".ui.ShellActivity"
+            android:launchMode="singleTask" />
+
+        <activity
+            android:name=".ui.LoginActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.HandleRedirectActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="${redirectScheme}" />
+            </intent-filter>
+        </activity>
+
+        <!-- Feature screens -->
+        <activity android:name=".ui.TransactionActivity" />
+        <activity android:name=".ui.TransactionEntryActivity" />
+        <activity android:name=".ui.GenerateReportActivity" />
+        <activity android:name=".ui.TransactionDetailActivity" />
+        <activity android:name=".ui.BulkAddActivity" />
+        <activity android:name=".ui.ImportExcelActivity" />
+        <activity android:name=".ui.SettingsActivity" />
+        <activity android:name=".ui.AuditLogActivity" />
+        <activity android:name=".ui.EntryDetailActivity" />
+        <activity android:name=".ui.TxnEditHistoryActivity" />
+        <activity android:name=".ui.AttachmentPreviewActivity" />
+        <activity android:name=".ui.SchedulerActivity" />
+        <activity android:name=".ui.PassbookActivity" />
+        <activity
+            android:name=".ui.PassbookCopyActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
+            android:exported="false" />
+        <activity android:name=".ui.LogActivity" />
+        <activity android:name=".ui.BudgetActivity" />
+        <activity android:name=".ui.StatsActivity" />
+        <activity android:name=".ui.CategoryStatsActivity" />
+        <activity android:name=".ui.BackupActivity" />
+        <activity android:name=".ui.ConfigActivity" />
+        <activity android:name=".ui.AllTransactionsActivity" />
+        <activity
+            android:name=".ui.IntegrationsCalendarActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.AddTaskActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.TaskPreviewActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.IntegrationsActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.AddEventActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.MonthlyCategoryReportActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.CalendarViewActivity"
+            android:exported="false"
+            android:label="Calendar View" />
+        <activity
+            android:name=".ui.AddReminderActivity"
+            android:exported="false" />
+        <activity
+            android:name=".ui.RemindersListActivity"
+            android:exported="false" />
+        <activity android:name=".ui.SequenceActivity" />
+        <activity android:name=".ui.BudgetConfigActivity" />
+        <activity android:name=".ui.SqlConsoleActivity" />
+        <activity android:name=".ui.ReportPdfPreviewActivity" />
+        <activity android:name=".ui.FoodTrackerActivity" />
+        <activity android:name=".ui.SettlementLinkActivity" />
+
+        <receiver
+            android:name=".receiver.PreAlarmReceiver"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.ChatActivity"
+            android:label="AI Assistant"
+            android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name="com.expenseos.android.timesheet.TimesheetActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".ui.RecycleBinActivity"
+            android:exported="false" />
+        <!-- Global search — screens + masters + transaction data -->
+        <activity
+            android:name=".ui.GlobalSearchActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".ui.LockActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize|stateVisible" />
+        <!-- Needed for camera capture in TransactionEntryActivity — the
+             camera app writes the photo to a content:// URI we hand it,
+             which requires a FileProvider rather than a raw file:// path. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Daily 9 PM reminder -->
+        <receiver
+            android:name=".receiver.ReminderReceiver"
+            android:exported="false" />
+
+        <!-- Task notification reminders -->
+        <receiver
+            android:name=".receiver.TaskNotificationReceiver"
+            android:exported="false" />
+
+        <!-- Task alarms (full-screen ring) -->
+        <receiver
+            android:name=".receiver.AlarmReceiver"
+            android:exported="false" />
+
+        <service
+            android:name=".receiver.AlarmService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <activity
+            android:name=".ui.AlarmRingActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true" />
+
+        <receiver
+            android:name=".receiver.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+            </intent-filter>
+        </receiver>
+
+        <activity
+            android:name="com.expenseos.ui.InsightsActivity"
+            android:label="Insights &amp; Reports"
+            android:parentActivityName="com.expenseos.ui.ShellActivity" />
+    </application>
+</manifest>

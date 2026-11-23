@@ -1,0 +1,452 @@
+package com.expenseos.adapter;
+
+import android.content.Context;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.AbsoluteSizeSpan;
+import android.text.style.BackgroundColorSpan;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.StyleSpan;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.TextView;
+
+import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
+import androidx.recyclerview.widget.RecyclerView;
+
+import com.expenseos.R;
+import com.expenseos.db.LocalDB;
+import com.expenseos.model.Transaction;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
+public class TransactionAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
+
+    private static final int TYPE_HEADER = 0;
+    private static final int TYPE_TXN = 1;
+    private boolean showBookLabel;
+    private java.util.Map<Integer, String> bookNameCache; // lazy-loaded, only used when showBookLabel=true
+
+
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("h:mm a");
+
+    public interface OnTxnClick {
+        void onClick(Transaction t);
+    }
+
+    public interface OnTxnLongClick {
+        void onLongClick(Transaction t);
+    }
+
+    // Sealed-ish row model: either a date header (CharSequence + that day's
+    // income/expense totals) or a Transaction
+    private static class Row {
+        final int type;
+        final CharSequence headerText;
+        final Transaction txn;
+        final java.math.BigDecimal headerIncome;
+        final java.math.BigDecimal headerExpense;
+
+        Row(CharSequence headerText, java.math.BigDecimal income, java.math.BigDecimal expense) {
+            this.type = TYPE_HEADER;
+            this.headerText = headerText;
+            this.txn = null;
+            this.headerIncome = income;
+            this.headerExpense = expense;
+        }
+
+        Row(Transaction txn) {
+            this.type = TYPE_TXN;
+            this.headerText = null;
+            this.txn = txn;
+            this.headerIncome = null;
+            this.headerExpense = null;
+        }
+    }
+
+    private final Context ctx;
+    private final SQLiteDatabase readDb;
+    private final List<Row> rows = new ArrayList<>();
+    private final OnTxnLongClick onLongClick;
+    private final OnTxnClick onClick;
+
+    // ── Long-press multi-select ──────────────────────────
+    public interface OnSelectionChanged {
+        void onChanged(int selectedCount);
+    }
+
+    private final Set<Integer> selectedIds = new LinkedHashSet<>();
+    private boolean selectionMode = false;
+    private OnSelectionChanged selectionListener;
+
+    public void setOnSelectionChanged(OnSelectionChanged l) {
+        this.selectionListener = l;
+    }
+
+    public boolean isSelectionMode() {
+        return selectionMode;
+    }
+
+    public int getSelectableCount() {
+        int n = 0;
+        for (Row r : rows) if (r.type == TYPE_TXN) n++;
+        return n;
+    }
+
+    public List<Transaction> getSelectedTransactions() {
+        List<Transaction> out = new ArrayList<>();
+        for (Row r : rows)
+            if (r.type == TYPE_TXN && selectedIds.contains(r.txn.getId())) out.add(r.txn);
+        return out;
+    }
+
+    public void selectAll() {
+        selectedIds.clear();
+        for (Row r : rows) if (r.type == TYPE_TXN) selectedIds.add(r.txn.getId());
+        selectionMode = !selectedIds.isEmpty();
+        notifyDataSetChanged();
+        if (selectionListener != null) selectionListener.onChanged(selectedIds.size());
+    }
+
+    public void clearSelection() {
+        selectedIds.clear();
+        selectionMode = false;
+        notifyDataSetChanged();
+        if (selectionListener != null) selectionListener.onChanged(0);
+    }
+
+    // NEW constructor — for All Transactions screen
+    public TransactionAdapter(Context ctx, List<Transaction> list,
+                              OnTxnLongClick onLongClick, OnTxnClick onClick,
+                              boolean showBookLabel) {
+        this.ctx = ctx;
+        this.readDb = LocalDB.getInstance(ctx).getReadableDatabase();
+        this.onLongClick = onLongClick;
+        this.onClick = onClick;
+        this.showBookLabel = showBookLabel;
+        if (showBookLabel) loadBookNames();
+        setData(list);
+    }
+
+
+    public TransactionAdapter(Context ctx, List<Transaction> list,
+                              OnTxnLongClick onLongClick,
+                              OnTxnClick onClick) {
+        this.ctx = ctx;
+        this.readDb = LocalDB.getInstance(ctx).getReadableDatabase();
+        this.onLongClick = onLongClick;
+        this.onClick = onClick;
+        setData(list);
+    }
+
+    public TransactionAdapter(Context ctx, List<Transaction> list) {
+        this(ctx, list, null, null);
+    }
+
+    /**
+     * Rebuilds the grouped row list (header + transactions) from a flat list.
+     * Each date header also carries that day's income/expense totals.
+     */
+    public void setData(List<Transaction> list) {
+        rows.clear();
+        if (list == null) {
+            notifyDataSetChanged();
+            return;
+        }
+
+        // First pass: sum income/expense per date — headers need each day's
+        // total, not a running total, so this has to be computed up front
+        // rather than accumulated while walking the (already date-sorted) list.
+        java.util.Map<LocalDate, java.math.BigDecimal[]> totalsByDate = new java.util.HashMap<>();
+        for (Transaction t : list) {
+            LocalDateTime dt = t.getDateTime();
+            if (dt == null) continue;
+            LocalDate d = dt.toLocalDate();
+            java.math.BigDecimal[] totals = totalsByDate.computeIfAbsent(d,
+                    k -> new java.math.BigDecimal[]{java.math.BigDecimal.ZERO, java.math.BigDecimal.ZERO});
+            java.math.BigDecimal amt = t.getAmount() != null ? t.getAmount() : java.math.BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) totals[0] = totals[0].add(amt);
+            else totals[1] = totals[1].add(amt);
+        }
+
+        LocalDate lastDate = null;
+        for (Transaction t : list) {
+            LocalDateTime dt = t.getDateTime();
+            LocalDate d = dt != null ? dt.toLocalDate() : null;
+            if (d != null && !d.equals(lastDate)) {
+                java.math.BigDecimal[] totals = totalsByDate.get(d);
+                rows.add(new Row(formatHeaderDate(dt), totals[0], totals[1]));
+                lastDate = d;
+            }
+            rows.add(new Row(t));
+        }
+        notifyDataSetChanged();
+    }
+
+    @Override
+    public int getItemViewType(int position) {
+        return rows.get(position).type;
+    }
+
+    static class HeaderVH extends RecyclerView.ViewHolder {
+        TextView tvHeader, tvTotals;
+
+        HeaderVH(View v) {
+            super(v);
+            tvHeader = v.findViewById(R.id.tvHeaderDate);
+            tvTotals = v.findViewById(R.id.tvHeaderTotals);
+        }
+    }
+
+    static class TxnVH extends RecyclerView.ViewHolder {
+        TextView tvDate, tvCat, tvSubCat, tvPaymentType, tvAmount, tvNote, tvBalance, tvSyncDot, tvAttachments, tvSettleStatus, tvBook;
+        View typeBadge;
+
+        TxnVH(View v) {
+            super(v);
+            tvDate = v.findViewById(R.id.tvTxnDate);
+            tvCat = v.findViewById(R.id.tvTxnCat);
+            tvSubCat = v.findViewById(R.id.tvTxnSubCat);
+            tvPaymentType = v.findViewById(R.id.tvTxnPaymentType);
+            tvAmount = v.findViewById(R.id.tvTxnAmount);
+            tvNote = v.findViewById(R.id.tvTxnNote);
+            tvBalance = v.findViewById(R.id.tvTxnBalance);
+            tvSyncDot = v.findViewById(R.id.tvTxnSyncDot);
+            tvAttachments = v.findViewById(R.id.tvTxnAttachments);
+            tvSettleStatus = v.findViewById(R.id.tvTxnSettleStatus);
+            tvBook = v.findViewById(R.id.tvTxnBook);
+            typeBadge = v.findViewById(R.id.viewTypeBadge);
+        }
+    }
+
+    @NonNull
+    @Override
+    public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+        if (viewType == TYPE_HEADER) {
+            View v = LayoutInflater.from(ctx).inflate(R.layout.item_date_header, parent, false);
+            return new HeaderVH(v);
+        }
+        View v = LayoutInflater.from(ctx).inflate(R.layout.item_transaction, parent, false);
+        return new TxnVH(v);
+    }
+
+    @Override
+    public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int pos) {
+        Row row = rows.get(pos);
+
+        if (row.type == TYPE_HEADER) {
+            HeaderVH hh = (HeaderVH) holder;
+            hh.tvHeader.setText(row.headerText);
+            hh.tvTotals.setText(buildHeaderTotalsText(row.headerIncome, row.headerExpense));
+            return;
+        }
+
+        TxnVH h = (TxnVH) holder;
+        Transaction t = row.txn;
+        boolean isIncome = t.getType() == Transaction.Type.INCOME;
+
+        LocalDateTime dt = t.getDateTime();
+        h.tvDate.setText(dt != null ? dt.format(TIME_FMT) : "");
+
+        h.typeBadge.setBackgroundResource(isIncome
+                ? R.drawable.bg_badge_income : R.drawable.bg_badge_expense);
+
+        h.tvCat.setText(t.getCategoryName() != null ? t.getCategoryName() : "");
+        h.tvCat.setOnLongClickListener(v -> {
+            android.widget.Toast.makeText(ctx, "Transaction ID: " + t.getId(), android.widget.Toast.LENGTH_SHORT).show();
+            return true;
+        });
+
+        String sub = t.getSubCategoryName();
+        h.tvSubCat.setText(sub != null ? sub : "");
+        h.tvSubCat.setVisibility(sub != null && !sub.isEmpty() ? View.VISIBLE : View.GONE);
+
+        h.tvPaymentType.setText(t.getPaymentType() != null ? t.getPaymentType() : "");
+        h.tvPaymentType.setVisibility(t.getPaymentType() != null && !t.getPaymentType().isEmpty() ? View.VISIBLE : View.GONE);
+
+        h.tvAmount.setText(t.getFormattedAmount());
+        h.tvAmount.setTextColor(ContextCompat.getColor(ctx,
+                isIncome ? R.color.green : R.color.red));
+
+        h.tvNote.setText(t.getNote() != null ? t.getNote() : "");
+
+        if (showBookLabel && bookNameCache != null) {
+            String bookName = bookNameCache.get(t.getBookId());
+            h.tvBook.setText("📒 " + (bookName != null ? bookName : "Book #" + t.getBookId()));
+            h.tvBook.setVisibility(View.VISIBLE);
+        } else {
+            h.tvBook.setVisibility(View.GONE);
+        }
+
+        if (t.getRunningBalance() != null) {
+            h.tvBalance.setText("Balance: " + t.getRunningBalance().toPlainString());
+        } else {
+            h.tvBalance.setText("");
+        }
+
+        h.tvSyncDot.setVisibility(View.VISIBLE);
+        if (t.isSynced()) {
+            h.tvSyncDot.setText("● synced");
+            h.tvSyncDot.setTextColor(ContextCompat.getColor(ctx, R.color.green));
+        } else {
+            h.tvSyncDot.setText("● sync");
+            h.tvSyncDot.setTextColor(ContextCompat.getColor(ctx, R.color.red));
+        }
+
+        int attCount = getAttachmentCount(t.getId());
+        if (attCount > 0) {
+            h.tvAttachments.setText("📎 " + attCount + (attCount == 1 ? " Attachment" : " Attachments"));
+            h.tvAttachments.setVisibility(View.VISIBLE);
+        } else {
+            h.tvAttachments.setVisibility(View.GONE);
+        }
+
+        String settleStatus = getSettlementStatus(t);
+        if (settleStatus != null) {
+            h.tvSettleStatus.setText(settleStatus);
+            h.tvSettleStatus.setTextColor(ContextCompat.getColor(ctx,
+                    settleStatus.startsWith("✓") ? R.color.green : R.color.amber));
+            h.tvSettleStatus.setVisibility(View.VISIBLE);
+        } else {
+            h.tvSettleStatus.setVisibility(View.GONE);
+        }
+
+        boolean selected = selectedIds.contains(t.getId());
+        if (h.itemView instanceof com.google.android.material.card.MaterialCardView card) {
+            float d = ctx.getResources().getDisplayMetrics().density;
+            card.setStrokeWidth(selected ? (int) (2 * d + 0.5f) : (int) (1 * d + 0.5f));
+            card.setStrokeColor(selected
+                    ? ContextCompat.getColor(ctx, R.color.primary)
+                    : ContextCompat.getColor(ctx, R.color.border));
+        }
+
+        h.itemView.setOnClickListener(v -> {
+            if (selectionMode) {
+                if (!selectedIds.remove(t.getId())) selectedIds.add(t.getId());
+                if (selectedIds.isEmpty()) selectionMode = false;
+                notifyDataSetChanged();
+                if (selectionListener != null) selectionListener.onChanged(selectedIds.size());
+            } else if (onClick != null) {
+                onClick.onClick(t);
+            }
+        });
+
+        h.itemView.setOnLongClickListener(v -> {
+            if (!selectionMode) {
+                selectionMode = true;
+                selectedIds.add(t.getId());
+                notifyDataSetChanged();
+                if (selectionListener != null) selectionListener.onChanged(selectedIds.size());
+            }
+            if (onLongClick != null) onLongClick.onLongClick(t);
+            return true;
+        });
+    }
+
+    @Override
+    public int getItemCount() {
+        return rows.size();
+    }
+
+    private int getAttachmentCount(int transactionId) {
+        try (Cursor c = readDb.rawQuery(
+                "SELECT COUNT(*) FROM transaction_receipts WHERE transaction_id = ?",
+                new String[]{String.valueOf(transactionId)})) {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        }
+    }
+
+    // "✓ Fully settled" / "◐ Partially settled" / null (edhும் link aagalai)
+    private String getSettlementStatus(Transaction t) {
+        double linked = 0;
+        try (Cursor c = readDb.rawQuery(
+                "SELECT SUM(amount) FROM settlement_links WHERE settlement_txn_id=? OR linked_txn_id=?",
+                new String[]{String.valueOf(t.getId()), String.valueOf(t.getId())})) {
+            if (c.moveToFirst() && !c.isNull(0)) linked = c.getDouble(0);
+        }
+        if (linked <= 0) return null;
+        double remaining = t.getAmount().doubleValue() - linked;
+        return remaining <= 0.005 ? "✓ Fully settled" : "◐ Partially settled";
+    }
+
+    // ── Header Date Formatting: "19 Tue 05.2026" ─────────────────────
+    // Day badge is colored by weekend day: Saturday = blue, Sunday = red,
+    // every other day keeps the neutral gray.
+    public CharSequence formatHeaderDate(LocalDateTime dateTime) {
+        if (dateTime == null) return "";
+
+        String dayNumber = dateTime.format(DateTimeFormatter.ofPattern("dd"));       // e.g., "19"
+        String dayName = " " + dateTime.format(DateTimeFormatter.ofPattern("EEE")) + " "; // e.g., " Tue "
+        String monthYear = " " + dateTime.format(DateTimeFormatter.ofPattern("MM.yyyy")); // e.g., " 05.2026"
+
+        java.time.DayOfWeek dow = dateTime.getDayOfWeek();
+        String badgeColor = dow == java.time.DayOfWeek.SATURDAY ? "#1565C0"
+                : dow == java.time.DayOfWeek.SUNDAY ? "#D32F2F"
+                  : "#808080";
+
+        SpannableStringBuilder builder = new SpannableStringBuilder();
+
+        // 1. Date Number (19) - Bold & Big
+        int start = builder.length();
+        builder.append(dayNumber);
+        builder.setSpan(new AbsoluteSizeSpan(18, true), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        builder.setSpan(new StyleSpan(Typeface.BOLD), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        builder.setSpan(new ForegroundColorSpan(Color.BLACK), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+
+        // 2. Day Badge ( Tue ) - Highlight Background, colored by weekend day
+        builder.append(" ");
+        start = builder.length();
+        builder.append(dayName);
+        builder.setSpan(new BackgroundColorSpan(Color.parseColor(badgeColor)), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        builder.setSpan(new ForegroundColorSpan(Color.WHITE), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        builder.setSpan(new AbsoluteSizeSpan(12, true), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        builder.setSpan(new StyleSpan(Typeface.BOLD), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+
+        // 3. Month.Year (05.2026) - Small Grey Text
+        start = builder.length();
+        builder.append(monthYear);
+        builder.setSpan(new AbsoluteSizeSpan(13, true), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        builder.setSpan(new ForegroundColorSpan(ContextCompat.getColor(ctx, R.color.text_muted)), start, builder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+
+        return builder;
+    }
+
+    // ── Per-day income/expense totals shown at the right of the header ──
+    private CharSequence buildHeaderTotalsText(java.math.BigDecimal income, java.math.BigDecimal expense) {
+        String incStr = "₹" + (income != null ? income.setScale(2, java.math.RoundingMode.HALF_UP).toPlainString() : "0.00");
+        String expStr = "₹" + (expense != null ? expense.setScale(2, java.math.RoundingMode.HALF_UP).toPlainString() : "0.00");
+
+        SpannableStringBuilder sb = new SpannableStringBuilder();
+
+        int start = sb.length();
+        sb.append(incStr);
+        sb.setSpan(new ForegroundColorSpan(ContextCompat.getColor(ctx, R.color.primary)), start, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+
+        sb.append("   ");
+
+        start = sb.length();
+        sb.append(expStr);
+        sb.setSpan(new ForegroundColorSpan(ContextCompat.getColor(ctx, R.color.danger)), start, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+
+        return sb;
+    }
+
+    private void loadBookNames() {
+        bookNameCache = new java.util.HashMap<>();
+        try (Cursor c = readDb.rawQuery("SELECT id, name FROM cash_books", null)) {
+            while (c.moveToNext()) bookNameCache.put(c.getInt(0), c.getString(1));
+        }
+    }
+}

@@ -1,0 +1,1047 @@
+package com.expenseos.ui;
+
+import android.app.AlertDialog;
+import android.app.DatePickerDialog;
+import android.content.Intent;
+import android.database.Cursor;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.MediaStore;
+import android.provider.OpenableColumns;
+import android.speech.RecognizerIntent;
+import android.text.Editable;
+import android.text.TextUtils;
+import android.text.TextWatcher;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.ListPopupWindow;
+import android.widget.Spinner;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.Nullable;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.FileProvider;
+
+import com.expenseos.R;
+import com.expenseos.adapter.NoteSuggestionAdapter;
+import com.expenseos.dao.CategoryDao;
+import com.expenseos.dao.ColumnDefinitionDao;
+import com.expenseos.dao.KeywordMappingDao;
+import com.expenseos.dao.PaymentTypeDao;
+import com.expenseos.dao.ReceiptDao;
+import com.expenseos.dao.SubCategoryDao;
+import com.expenseos.dao.TransactionDao;
+import com.expenseos.model.Category;
+import com.expenseos.model.ColumnDefinition;
+import com.expenseos.model.KeywordMapping;
+import com.expenseos.model.PaymentType;
+import com.expenseos.model.Receipt;
+import com.expenseos.model.SubCategory;
+import com.expenseos.model.Transaction;
+import com.expenseos.util.AppConfig;
+import com.expenseos.util.ConsoleLogger;
+import com.google.android.material.bottomsheet.BottomSheetDialog;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.InputStream;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Full-screen replacement for the old "+Add Income"/"+Add Expense" popup
+ * dialogs. Supports switching between Income/Expense (add mode only —
+ * changing type mid-edit would orphan the category/subcategory), category ->
+ * subcategory cascade, dynamic custom fields (picked from already-defined
+ * column_definitions only — this screen never creates new field
+ * definitions), and receipt attachments.
+ */
+public class TransactionEntryActivity extends AppCompatActivity {
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("hh:mm a");
+    private final ConsoleLogger log = ConsoleLogger.get();
+
+    private static final int REQ_ATTACH = 1001;
+    private static final int REQ_SPEECH = 1002;
+    private static final int REQ_CAMERA = 1003;
+
+    private int bookId;
+    private int txnId = -1; // -1 = add mode
+    private Transaction.Type currentType = Transaction.Type.INCOME;
+    private Transaction editingOriginal;
+
+    private TransactionDao txnDao;
+    private CategoryDao catDao;
+    private SubCategoryDao subCatDao;
+    private ColumnDefinitionDao colDefDao;
+    private ReceiptDao receiptDao;
+    private PaymentTypeDao payDao;
+    private KeywordMappingDao kwDao;
+
+    private LocalDate selectedDate = LocalDate.now();
+    private LocalTime selectedTime = LocalTime.now();
+
+    private List<Category> currentCategories = new ArrayList<>();
+    private final List<SubCategory> currentSubCategories = new ArrayList<>();
+
+    // col_key -> input, for whichever custom fields are currently on screen
+    private final Map<String, EditText> customFieldInputs = new LinkedHashMap<>();
+    private final List<PendingAttachment> pendingAttachments = new ArrayList<>();
+    private Uri pendingCameraUri; // set right before launching the camera intent, consumed in onActivityResult
+
+    private TextView tvTitle, btnBack, btnFieldSettings, tabIncome, tabExpense, tvDate, tvTime, btnMic, tvKwSuggestion;
+    private LinearLayout boxDate, boxTime, boxAmount, btnAttach, attachmentList, customFieldsContainer;
+    private EditText etAmount, etNote;
+    private View btnCalculator;
+    private TextView tvCategoryField;
+    private Category selectedCategory;
+    private SubCategory selectedSubCategory;
+    private Spinner spPaymentType;
+    private Button btnSaveAddNew, btnSave;
+    private KeywordMapping pendingSuggestion;
+    private Integer pendingSubCategoryId;
+
+    @Override
+    protected void onCreate(Bundle s) {
+        super.onCreate(s);
+        // Bottom-sheet style entrance/exit — slides up over the previous
+        // screen instead of the default hard-cut/slide-right transition.
+        // overrideActivityTransition() (API 34+) registers both directions
+        // up front; overridePendingTransition() (older) is called per-call
+        // (entry here, exit in finish() below) since it has no "register
+        // once" form.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_OPEN, R.anim.slide_up_in, R.anim.slide_up_out);
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, R.anim.slide_down_in, R.anim.slide_down_out);
+        } else {
+            overridePendingTransition(R.anim.slide_up_in, R.anim.slide_up_out);
+        }
+        setContentView(R.layout.activity_transaction_entry);
+
+//        SharedPreferences prefs = getSharedPreferences("expenseos_prefs", MODE_PRIVATE);
+//        bookId = prefs.getInt("active_book_id", 0);
+
+        bookId = AppConfig.get(this).getActiveBookId();
+
+        txnDao = new TransactionDao(this);
+        catDao = new CategoryDao(this);
+        subCatDao = new SubCategoryDao(this);
+        colDefDao = new ColumnDefinitionDao(this);
+        receiptDao = new ReceiptDao(this);
+        payDao = new PaymentTypeDao(this);
+        kwDao = new KeywordMappingDao(this);
+
+        bindViews();
+        setupClicks();
+        wireDescriptionAutoSuggest();
+        wireNoteSuggestions();
+
+        txnId = getIntent().getIntExtra("txnId", -1);
+
+        if (txnId > 0) {
+            loadForEdit();
+        } else {
+            String typeExtra = getIntent().getStringExtra("type");
+            currentType = "EXPENSE".equals(typeExtra) ? Transaction.Type.EXPENSE : Transaction.Type.INCOME;
+            applyTypeUI();
+            loadCategoriesForType();
+            loadCustomFieldsForType(null);
+            loadPaymentTypes(null); // defaults to UPI
+            updateDateTimeText();
+        }
+
+        // Land straight in "typing the amount" mode instead of requiring an
+        // extra tap — matches the old app's behavior.
+        etAmount.requestFocus();
+        etAmount.post(() -> {
+            InputMethodManager imm =
+                    (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null)
+                imm.showSoftInput(etAmount, InputMethodManager.SHOW_IMPLICIT);
+        });
+    }
+
+    @Override
+    public void finish() {
+        super.finish();
+        // API 34+ already has the close transition registered in onCreate()
+        // — only pre-34 devices need this per-call trigger.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overridePendingTransition(R.anim.slide_down_in, R.anim.slide_down_out);
+        }
+    }
+
+    private void bindViews() {
+        tvTitle = findViewById(R.id.tvTitle);
+        btnBack = findViewById(R.id.btnBack);
+        btnFieldSettings = findViewById(R.id.btnFieldSettings);
+        tabIncome = findViewById(R.id.tabIncome);
+        tabExpense = findViewById(R.id.tabExpense);
+        boxDate = findViewById(R.id.boxDate);
+        boxTime = findViewById(R.id.boxTime);
+        boxAmount = findViewById(R.id.boxAmount);
+        tvDate = findViewById(R.id.tvDate);
+        tvTime = findViewById(R.id.tvTime);
+        etAmount = findViewById(R.id.etAmount);
+        btnCalculator = findViewById(R.id.btnCalc);
+        spPaymentType = findViewById(R.id.spPaymentType);
+        etNote = findViewById(R.id.etNote);
+        btnMic = findViewById(R.id.btnMic);
+        btnAttach = findViewById(R.id.btnAttach);
+        attachmentList = findViewById(R.id.attachmentList);
+        tvCategoryField = findViewById(R.id.tvCategoryField);
+        tvKwSuggestion = findViewById(R.id.tvKwSuggestion);
+        customFieldsContainer = findViewById(R.id.customFieldsContainer);
+        btnSaveAddNew = findViewById(R.id.btnSaveAddNew);
+        btnSave = findViewById(R.id.btnSave);
+    }
+
+    private void setupClicks() {
+        btnBack.setOnClickListener(v -> finish());
+        btnFieldSettings.setOnClickListener(v -> {
+            Intent i = new Intent(this, SettingsActivity.class);
+            i.putExtra("bookScoped", true);
+            i.putExtra("bookId", bookId);
+            i.putExtra("startTab", 0); // 0=Categories, 1=Sub-Categories, 2=Columns
+            startActivity(i);
+        });
+
+        tabIncome.setOnClickListener(v -> switchType(Transaction.Type.INCOME));
+        tabExpense.setOnClickListener(v -> switchType(Transaction.Type.EXPENSE));
+
+        boxDate.setOnClickListener(v -> {
+            hideKeyboard();
+            showDatePicker();
+        });
+        boxTime.setOnClickListener(v -> {
+            hideKeyboard();
+            showTimePicker();
+        });
+
+        btnMic.setOnClickListener(v -> startVoiceInput());
+        btnAttach.setOnClickListener(v -> {
+            hideKeyboard();
+            if (com.expenseos.cloud.SupabaseStorage.isSignedIn(this)
+                    && com.expenseos.cloud.FileCrypto.isReady(this)) pickAttachment();
+            else Toast.makeText(this, "Attachments need Supabase Storage settings and the cloud passphrase. Set both under Config first.",
+                    Toast.LENGTH_LONG).show();
+        });
+
+        btnCalculator = findViewById(R.id.btnCalc);
+        btnCalculator.setOnClickListener(v ->
+                CalculatorDialog.show(this, etAmount.getText().toString(), resultText ->
+                        etAmount.setText(resultText)));
+
+        btnSaveAddNew.setOnClickListener(v -> save(true));
+        btnSave.setOnClickListener(v -> save(false));
+
+        // Payment-type Spinner has no "before it opens" click callback,
+        // so ACTION_DOWN touch hides the keyboard first (return false —
+        // the dropdown still opens as normal after).
+        dismissKeyboardOnTouch(spPaymentType);
+
+        // NEW — CategoryPickerSheet.show() now takes bookId (int) as its 4th param
+// instead of a nullable pre-selected category id — used by the sheet's ✎
+// edit button to jump straight to Settings → Categories for this book.
+        tvCategoryField.setOnClickListener(v -> {
+            hideKeyboard();
+            CategoryPickerSheet.show(this, currentCategories, subCatDao,
+                    selectedCategory != null ? selectedCategory.getId() : null, bookId,
+                    (category, subCategory) -> {
+                        selectedCategory = category;
+                        selectedSubCategory = subCategory;
+                        updateCategoryFieldText();
+                    });
+        });
+    }
+
+    private void updateCategoryFieldText() {
+        if (selectedCategory == null) {
+            tvCategoryField.setText("Select Category");
+            tvCategoryField.setTextColor(getColor(R.color.text_muted));
+        } else {
+            tvCategoryField.setText(selectedCategory.getName() +
+                    (selectedSubCategory != null ? " ▸ " + selectedSubCategory.getName() : ""));
+            tvCategoryField.setTextColor(getColor(R.color.text_primary));
+        }
+    }
+
+    private void dismissKeyboardOnTouch(View v) {
+        v.setOnTouchListener((view, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_DOWN) hideKeyboard();
+            return false; // touch event-ah normal-ah continue pannunga (dropdown open aaganum)
+        });
+    }
+
+    private void hideKeyboard() {
+        View focused = getCurrentFocus();
+        if (focused == null) return;
+        InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (imm != null) imm.hideSoftInputFromWindow(focused.getWindowToken(), 0);
+    }
+
+    // ── Income/Expense tab switch (add mode only) ──────────
+    private void switchType(Transaction.Type type) {
+        /*if (txnId > 0) {
+            Toast.makeText(this, "Type can't be changed while editing", Toast.LENGTH_SHORT).show();
+            return;
+        } */
+        if (type == currentType) return;
+        currentType = type;
+        applyTypeUI();
+        loadCategoriesForType();
+        clearCustomFields();
+        loadCustomFieldsForType(null);
+    }
+
+    private void applyTypeUI() {
+        boolean income = currentType == Transaction.Type.INCOME;
+        String prefix = txnId > 0 ? "Edit " : "+ Add ";
+        tvTitle.setText(prefix + (income ? "Income" : "Expense"));
+        tvTitle.setTextColor(getColor(income ? R.color.green : R.color.red));
+        etAmount.setTextColor(getColor(income ? R.color.green : R.color.red));
+
+        tabIncome.setTextColor(getColor(income ? R.color.green : R.color.text_secondary));
+        tabIncome.setTypeface(null, income ? Typeface.BOLD : Typeface.NORMAL);
+        tabExpense.setTextColor(getColor(!income ? R.color.red : R.color.text_secondary));
+        tabExpense.setTypeface(null, !income ? Typeface.BOLD : Typeface.NORMAL);
+
+        /*if (txnId > 0) {
+            tabIncome.setAlpha(0.4f);
+            tabExpense.setAlpha(0.4f);
+        } */
+
+        // Tint just this EditText's border — mutate() so it doesn't affect
+        // the other views sharing the same bg_input_box drawable resource.
+        Object bg = boxAmount.getBackground();
+        //Object bg = etAmount.getBackground();
+        if (bg instanceof GradientDrawable) {
+            GradientDrawable gd = (GradientDrawable) ((GradientDrawable) bg).mutate();
+            gd.setStroke((int) (1.5f * getResources().getDisplayMetrics().density),
+                    getColor(income ? R.color.green : R.color.red));
+            boxAmount.setBackground(gd);
+            //etAmount.setBackground(gd);
+        }
+    }
+
+    // ── Date / Time pickers — plain system dialogs, so they automatically
+    // pick up the app's theme (colorPrimary etc.) without any custom styling ──
+    private void showDatePicker() {
+        new DatePickerDialog(this, (view, y, m, d) -> {
+            selectedDate = LocalDate.of(y, m + 1, d);
+            updateDateTimeText();
+        }, selectedDate.getYear(), selectedDate.getMonthValue() - 1, selectedDate.getDayOfMonth()).show();
+    }
+
+    private void showTimePicker() {
+        com.google.android.material.timepicker.MaterialTimePicker picker =
+                new com.google.android.material.timepicker.MaterialTimePicker.Builder()
+                        .setTimeFormat(com.google.android.material.timepicker.TimeFormat.CLOCK_12H)
+                        .setHour(selectedTime.getHour())
+                        .setMinute(selectedTime.getMinute())
+                        .setTitleText("Select time")
+                        .build();
+        picker.addOnPositiveButtonClickListener(v -> {
+            selectedTime = LocalTime.of(picker.getHour(), picker.getMinute());
+            updateDateTimeText();
+        });
+        picker.show(getSupportFragmentManager(), "time_picker");
+    }
+
+    private void updateDateTimeText() {
+        tvDate.setText(selectedDate.format(DATE_FMT));
+        tvTime.setText(selectedTime.format(TIME_FMT));
+    }
+
+    // ── Category -> Sub-category cascade ───────────────────
+    //no Spinner cascade needed anymore; CategoryPickerSheet queries
+    // sub-categories itself (per-category, on demand) when it builds its list.
+    private void loadCategoriesForType() {
+        currentCategories = catDao.findByType(currentType.name(), bookId);
+        selectedCategory = null;
+        selectedSubCategory = null;
+        updateCategoryFieldText();
+    }
+
+    // ── Description -> Category/Sub-category auto-pickup ──────────────
+    // As the user types the Remark/Note, looks for a saved keyword mapping
+    // (managed in Settings -> Keywords) whose keyword occurs in the note,
+    // and auto-selects that category/sub-category. Debounced, and never
+    // overrides a category already picked (manually, or from edit-mode
+    // load) — only fires while spCategory is still on its placeholder.
+    // Replace the whole "Description -> Category/Sub-category auto-pickup"
+// block I gave earlier with this tap-to-apply version:
+
+    private final Handler suggestHandler = new Handler(Looper.getMainLooper());
+    private Runnable suggestRunnable;
+
+    // Note-field autocomplete (past matching notes) — 💡 keyword-category
+    // suggestion (mேlе irukkura suggestHandler) vேறu, idhu vேறu feature.
+    private final Handler noteSuggestHandler = new Handler(Looper.getMainLooper());
+    private Runnable noteSuggestRunnable;
+    private ListPopupWindow noteSuggestPopup;
+    private NoteSuggestionAdapter noteSuggestAdapter;
+    private boolean suppressNoteSuggestion = false;
+
+    private void wireDescriptionAutoSuggest() {
+        etNote.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            // restores the keyword→category suggestion trigger, lost when the
+// note field's TextWatcher was merged with the note-autocomplete one
+// during the CategoryPickerSheet refactor. Two independent debounced
+// callbacks on the same keystroke — noteSuggestHandler for past-note
+// autocomplete, suggestHandler for the 💡 category/sub-category chip.
+
+            //this TextWatcher's only job is the 💡 keyword->category suggestion.
+            // Past-note autocomplete (the ListPopupWindow) is wireNoteSuggestions()'s
+// own, separate TextWatcher on the same etNote — it already debounces and
+// correctly respects suppressNoteSuggestion after a pick. Duplicating that
+// scheduling here meant a SECOND, suppress-blind call to
+// showNoteSuggestions() fired right after every pick, instantly reopening
+// the popup the user had just dismissed.
+            @Override
+            public void afterTextChanged(Editable e) {
+                String text = e.toString();
+                if (suggestRunnable != null) suggestHandler.removeCallbacks(suggestRunnable);
+                suggestRunnable = () -> showKeywordSuggestion(text);
+                suggestHandler.postDelayed(suggestRunnable, 350);
+            }
+        });
+
+        tvKwSuggestion.setOnClickListener(v -> applyPendingSuggestion());
+    }
+
+    // NEW — a filled category/sub-category no longer blocks the suggestion
+// outright. Instead: compute the match, then compare it against what's
+// currently selected. Same selection already → nothing new to offer, stay
+// hidden. Different (or nothing selected yet) → show it, since switching
+// category/note mid-entry is exactly when a better keyword match should
+// surface (e.g. "Snacks ▸ Tea" already picked, note edited to mention
+// "bus" → offer "Transport ▸ Bus" instead).
+    private boolean suggestionMatchesCurrentSelection(KeywordMapping match) {
+        if (selectedCategory == null) return false; // nothing picked yet — nothing to match
+        if (selectedCategory.getId() != match.getCategoryId()) return false;
+        Integer selSubId = selectedSubCategory != null ? selectedSubCategory.getId() : null;
+        return java.util.Objects.equals(selSubId, match.getSubCategoryId());
+    }
+
+    private void showKeywordSuggestion(String note) {
+        if (note == null || note.trim().length() < 3) {
+            pendingSuggestion = null;
+            tvKwSuggestion.setVisibility(View.GONE);
+            return;
+        }
+        KeywordMapping match = kwDao.suggest(note.trim(), currentType.name(), bookId);
+        if (match == null || suggestionMatchesCurrentSelection(match)) {
+            pendingSuggestion = null;
+            tvKwSuggestion.setVisibility(View.GONE);
+            return;
+        }
+        pendingSuggestion = match;
+        tvKwSuggestion.setText("💡 " + match.getCategoryName() +
+                (match.getSubCategoryName() != null ? " ▸ " + match.getSubCategoryName() : "") +
+                " — tap to apply");
+        tvKwSuggestion.setVisibility(View.VISIBLE);
+    }
+
+    // NEW
+    private void applyPendingSuggestion() {
+        if (pendingSuggestion == null) return;
+        selectedCategory = null;
+        for (Category c : currentCategories) {
+            if (c.getId() == pendingSuggestion.getCategoryId()) {
+                selectedCategory = c;
+                break;
+            }
+        }
+        selectedSubCategory = null;
+        if (selectedCategory != null && pendingSuggestion.getSubCategoryId() != null) {
+            for (SubCategory sc : subCatDao.findByCategoryId(selectedCategory.getId())) {
+                if (sc.getId() == pendingSuggestion.getSubCategoryId()) {
+                    selectedSubCategory = sc;
+                    break;
+                }
+            }
+        }
+        updateCategoryFieldText();
+        tvKwSuggestion.setVisibility(View.GONE);
+        pendingSuggestion = null;
+    }
+
+    // ── Custom fields now auto-populate for whatever type is selected —
+    // there's no "Add More Fields" button anymore. existingValues is null
+    // in add mode (fields start empty) or the transaction's saved
+    // key->value map in edit mode (fields start pre-filled).
+    private void loadCustomFieldsForType(@Nullable Map<String, String> existingValues) {
+        List<ColumnDefinition> defs = colDefDao.findByType(currentType.name());
+        for (ColumnDefinition cd : defs) {
+            String existing = existingValues != null ? existingValues.get(cd.getColKey()) : null;
+            addCustomFieldRow(cd, existing);
+        }
+    }
+
+    private void addCustomFieldRow(ColumnDefinition cd, @Nullable String existingValue) {
+        if (customFieldInputs.containsKey(cd.getColKey())) return;
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        rowLp.topMargin = dp(14);
+        row.setLayoutParams(rowLp);
+
+        TextView label = new TextView(this);
+        label.setText(cd.getColName());
+        label.setTextColor(getColor(R.color.primary));
+        label.setTextSize(13);
+        row.addView(label);
+
+        EditText input = new EditText(this);
+        LinearLayout.LayoutParams inputLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(48));
+        inputLp.topMargin = dp(4);
+        input.setLayoutParams(inputLp);
+        input.setBackgroundResource(R.drawable.bg_input_box);
+        input.setPadding(dp(12), 0, dp(12), 0);
+        if (existingValue != null) input.setText(existingValue);
+        row.addView(input);
+
+        customFieldsContainer.addView(row);
+        customFieldInputs.put(cd.getColKey(), input);
+    }
+
+    private void clearCustomFields() {
+        customFieldsContainer.removeAllViews();
+        customFieldInputs.clear();
+    }
+
+    // ── Voice input for Remark ──────────────────────────────
+    private void startVoiceInput() {
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak remark…");
+        try {
+            startActivityForResult(intent, REQ_SPEECH);
+        } catch (Exception e) {
+            Toast.makeText(this, "Voice input not available on this device", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // ── Attach Image or PDF — 3-option bottom sheet, matching the old app
+    // (this used to jump straight to the system file manager) ───────────
+    private void pickAttachment() {
+        BottomSheetDialog sheet =
+                new BottomSheetDialog(this);
+        com.expenseos.ui.glass.GlassUi.applyRealBlur(sheet.getWindow(), null);
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(0, dp(8), 0, dp(16));
+
+        TextView title = new TextView(this);
+        title.setText("Attach Image or PDF");
+        title.setTextSize(16);
+        title.setTypeface(null, Typeface.BOLD);
+        title.setPadding(dp(20), dp(12), dp(20), dp(12));
+        container.addView(title);
+
+        container.addView(attachSheetOption("📷", "Take photo using camera", () -> {
+            sheet.dismiss();
+            launchCamera();
+        }));
+        container.addView(attachSheetOption("🖼", "Choose from gallery", () -> {
+            sheet.dismiss();
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.setType("image/*");
+            startActivityForResult(intent, REQ_ATTACH);
+        }));
+        container.addView(attachSheetOption("📄", "Choose PDF", () -> {
+            sheet.dismiss();
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.setType("application/pdf");
+            startActivityForResult(intent, REQ_ATTACH);
+        }));
+
+        sheet.setContentView(container);
+        sheet.show();
+    }
+
+    private View attachSheetOption(String emoji, String label, Runnable onClick) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(20), dp(14), dp(20), dp(14));
+        row.setClickable(true);
+        row.setFocusable(true);
+
+        TypedValue outValue = new TypedValue();
+        getTheme().resolveAttribute(android.R.attr.selectableItemBackground, outValue, true);
+        row.setBackgroundResource(outValue.resourceId);
+
+        TextView tvEmoji = new TextView(this);
+        tvEmoji.setText(emoji);
+        tvEmoji.setTextSize(18);
+        tvEmoji.setLayoutParams(new LinearLayout.LayoutParams(dp(32), LinearLayout.LayoutParams.WRAP_CONTENT));
+        row.addView(tvEmoji);
+
+        TextView tvLabel = new TextView(this);
+        tvLabel.setText(label);
+        tvLabel.setTextSize(16);
+        tvLabel.setTextColor(getColor(R.color.text_primary));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        lp.leftMargin = dp(16);
+        tvLabel.setLayoutParams(lp);
+        row.addView(tvLabel);
+
+        row.setOnClickListener(v -> onClick.run());
+        return row;
+    }
+
+    // Requires a FileProvider declared in AndroidManifest.xml with
+    // authorities="${applicationId}.fileprovider" — see file_paths.xml.
+    private void launchCamera() {
+        try {
+            File dir = new File(getCacheDir(), "receipts");
+            if (!dir.exists()) dir.mkdirs();
+            File photoFile = File.createTempFile("receipt_", ".jpg", dir);
+            pendingCameraUri = FileProvider.getUriForFile(
+                    this, getPackageName() + ".fileprovider", photoFile);
+
+            Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, pendingCameraUri);
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            startActivityForResult(intent, REQ_CAMERA);
+        } catch (Exception e) {
+            Toast.makeText(this, "Camera not available: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (resultCode != RESULT_OK || data == null) return;
+
+        if (requestCode == REQ_ATTACH && data.getData() != null) {
+            Uri uri = data.getData();
+            try {
+                String name = queryFileName(uri);
+                String type = getContentResolver().getType(uri);
+                byte[] bytes = readBytes(uri);
+                PendingAttachment pa = new PendingAttachment(name, type, bytes);
+                pendingAttachments.add(pa);
+                addPendingAttachmentRow(pa);
+            } catch (Exception e) {
+                Toast.makeText(this, "Couldn't read file: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+        } else if (requestCode == REQ_CAMERA) {
+            if (pendingCameraUri != null) {
+                try {
+                    byte[] bytes = readBytes(pendingCameraUri);
+                    String name = "receipt_" + System.currentTimeMillis() + ".jpg";
+                    PendingAttachment pa = new PendingAttachment(name, "image/jpeg", bytes);
+                    pendingAttachments.add(pa);
+                    addPendingAttachmentRow(pa);
+                } catch (Exception e) {
+                    Toast.makeText(this, "Couldn't read photo: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                }
+                pendingCameraUri = null;
+            }
+        } else if (requestCode == REQ_SPEECH) {
+            ArrayList<String> results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+            if (results != null && !results.isEmpty()) {
+                String current = etNote.getText().toString().trim();
+                etNote.setText(current.isEmpty() ? results.get(0) : current + " " + results.get(0));
+            }
+        }
+    }
+
+    private String queryFileName(Uri uri) {
+        String name = "file";
+        try (Cursor c = getContentResolver().query(uri, null, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                int idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (idx >= 0) name = c.getString(idx);
+            }
+        }
+        return name;
+    }
+
+    private byte[] readBytes(Uri uri) throws Exception {
+        try (InputStream is = getContentResolver().openInputStream(uri);
+             ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[8192];
+            int n;
+            while (is != null && (n = is.read(buf)) != -1) bos.write(buf, 0, n);
+            return bos.toByteArray();
+        }
+    }
+
+    private void addPendingAttachmentRow(PendingAttachment pa) {
+        LinearLayout row = buildAttachmentRow("📎 " + pa.name, () -> {
+            pendingAttachments.remove(pa);
+        });
+        attachmentList.addView(row);
+    }
+
+    // Existing (already-saved) receipts in edit mode — remove deletes them
+    // from the DB immediately rather than just clearing an in-memory list.
+    private void addExistingReceiptRow(Receipt r) {
+        LinearLayout row = buildAttachmentRow("📎 " + r.getFileName() + " (" + r.getFileSizeDisplay() + ")", null);
+        View removeBtn = row.getChildAt(1);
+        removeBtn.setOnClickListener(v -> new AlertDialog.Builder(this)
+                .setTitle("Delete attachment?")
+                .setMessage(r.getFileName())
+                .setPositiveButton("Delete", (d, w) -> {
+                    receiptDao.delete(r.getId(), r.getTransactionId(), r.getFileName());
+                    attachmentList.removeView(row);
+                })
+                .setNegativeButton("Cancel", null)
+                .show());
+        attachmentList.addView(row);
+    }
+
+    private LinearLayout buildAttachmentRow(String text, @Nullable Runnable onRemove) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(40));
+        lp.topMargin = dp(6);
+        row.setLayoutParams(lp);
+
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextColor(getColor(R.color.text_secondary));
+        tv.setSingleLine(true);
+        tv.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        tv.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(tv);
+
+        TextView remove = new TextView(this);
+        remove.setText("✕");
+        remove.setTextColor(getColor(R.color.red));
+        remove.setPadding(dp(8), dp(8), dp(8), dp(8));
+        if (onRemove != null) {
+            remove.setOnClickListener(v -> {
+                onRemove.run();
+                attachmentList.removeView(row);
+            });
+        }
+        row.addView(remove);
+        return row;
+    }
+
+    private int dp(int v) {
+        return (int) (v * getResources().getDisplayMetrics().density);
+    }
+
+    // ── Edit mode ────────────────────────────────────────────
+    private void loadForEdit() {
+        log.info("method call loadforEdit");
+        editingOriginal = txnDao.findById(txnId);
+        if (editingOriginal == null) {
+            finish();
+            return;
+        }
+        currentType = editingOriginal.getType();
+        applyTypeUI();
+
+        selectedDate = editingOriginal.getDateTime().toLocalDate();
+        selectedTime = editingOriginal.getDateTime().toLocalTime();
+        updateDateTimeText();
+
+        etAmount.setText(editingOriginal.getAmount().toPlainString());
+        etNote.setText(editingOriginal.getNote());
+        // Old transactions created before this column existed have payment_type=NULL
+        // in the Java object if the DB row somehow predates the migration — default
+        // to "UPI" so the spinner always has a valid selection.
+        loadPaymentTypes(editingOriginal.getPaymentType());
+
+        currentCategories = catDao.findByType(currentType.name(), bookId);
+        selectedCategory = null;
+        for (Category c : currentCategories) {
+            if (c.getId() == editingOriginal.getCategoryId()) {
+                selectedCategory = c;
+                break;
+            }
+        }
+        selectedSubCategory = null;
+        if (selectedCategory != null && editingOriginal.getSubCategoryId() > 0) {
+            for (SubCategory sc : subCatDao.findByCategoryId(selectedCategory.getId())) {
+                if (sc.getId() == editingOriginal.getSubCategoryId()) {
+                    selectedSubCategory = sc;
+                    break;
+                }
+            }
+        }
+        updateCategoryFieldText();
+
+        // Show every field defined for this type — pre-filled where the
+        // transaction already has a saved value for it.
+        loadCustomFieldsForType(editingOriginal.getCustomValues());
+
+        for (Receipt r : receiptDao.findMetaByTransactionId(txnId))
+            addExistingReceiptRow(r);
+
+        btnSaveAddNew.setVisibility(View.GONE); // doesn't apply when editing one specific record
+    }
+
+    // ── Save ─────────────────────────────────────────────────
+    private void save(boolean addNew) {
+        String amtStr = etAmount.getText().toString().trim();
+        if (amtStr.isEmpty()) {
+            Toast.makeText(this, "Enter amount", Toast.LENGTH_SHORT).show();
+            return;
+        }
+// NEW — sub-category "required" is now checked against the real data
+// (does this category have any?), not a Spinner's visibility state.
+        if (selectedCategory == null) {
+            Toast.makeText(this, "Please select a category", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        List<SubCategory> subsForSelected = subCatDao.findByCategoryId(selectedCategory.getId());
+        if (!subsForSelected.isEmpty() && selectedSubCategory == null) {
+            Toast.makeText(this, "Please select a subcategory", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (spPaymentType.getSelectedItem() == null) {
+            Toast.makeText(this, "Select a payment type", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        String selectedPaymentName = ((PaymentType) spPaymentType.getSelectedItem()).getName();
+        String bookValidationError = AppConfig.validatePaymentTypeForBook(
+                AppConfig.get(this).getActiveBookName(), selectedPaymentName);
+        if (bookValidationError != null) {
+            Toast.makeText(this, bookValidationError, Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        BigDecimal amount;
+        try {
+            amount = new BigDecimal(amtStr);
+        } catch (Exception e) {
+            Toast.makeText(this, "Invalid amount", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        Transaction t = new Transaction();
+        t.setType(currentType);
+        t.setDateTime(LocalDateTime.of(selectedDate, selectedTime));
+        t.setAmount(amount);
+        t.setCategoryId(selectedCategory.getId());
+        t.setSubCategoryId(selectedSubCategory != null ? selectedSubCategory.getId() : 0);
+        t.setNote(etNote.getText().toString().trim());
+        t.setBookId(bookId);
+        t.setPaymentType(((PaymentType) spPaymentType.getSelectedItem()).getName());
+
+        Map<String, String> customValues = new LinkedHashMap<>();
+        for (Map.Entry<String, EditText> e : customFieldInputs.entrySet())
+            customValues.put(e.getKey(), e.getValue().getText().toString().trim());
+        t.setCustomValues(customValues);
+
+        if (txnId > 0) {
+            t.setId(txnId);
+            txnDao.update(editingOriginal, t);
+            txnDao.saveCustomValues(txnId, customValues);
+            saveAttachments(txnId);
+            Toast.makeText(this, "Updated!", Toast.LENGTH_SHORT).show();
+            finish();
+        } else {
+            long newId = txnDao.insert(t);
+            if (newId == -1) {
+                Toast.makeText(this, "Save failed", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            saveAttachments((int) newId);
+            Toast.makeText(this, "Saved!", Toast.LENGTH_SHORT).show();
+            if (addNew) resetFormForNewEntry();
+            else finish();
+        }
+    }
+
+    private void saveAttachments(int forTxnId) {
+        if (pendingAttachments.isEmpty()) return;
+        final List<PendingAttachment> batch = new ArrayList<>(pendingAttachments);
+        pendingAttachments.clear();
+        final android.content.Context app = getApplicationContext();
+        new Thread(() -> {
+            ReceiptDao dao = new ReceiptDao(app);
+            int failed = 0;
+            for (PendingAttachment pa : batch) {
+                try {
+                    Receipt r = new Receipt();
+                    r.setTransactionId(forTxnId);
+                    r.setFileName(pa.name);
+                    r.setFileType(pa.mimeType);
+                    r.setFileData(pa.bytes);
+                    r.setFileSize(pa.bytes != null ? pa.bytes.length : 0);
+                    dao.insert(r);
+                } catch (Exception e) {
+                    failed++;
+                }
+            }
+            final int f = failed;
+            if (f > 0)
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
+                        Toast.makeText(app, f + " attachment(s) failed to upload. Check your internet connection and Supabase settings.",
+                                Toast.LENGTH_LONG).show());
+        }).start();
+    }
+
+    private void resetFormForNewEntry() {
+        etAmount.setText("");
+        etNote.setText("");
+        clearCustomFields();
+        loadCustomFieldsForType(null); // re-show this type's fields — no button to bring them back otherwise
+        attachmentList.removeAllViews();
+        pendingAttachments.clear();
+        // Deliberately NOT resetting selectedDate/selectedTime — Save & Add
+        // New carries over the date/time just used, for quick back-to-back
+        // entries at the same timestamp.
+        etAmount.requestFocus();
+        etAmount.post(() -> {
+            InputMethodManager imm =
+                    (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            if (imm != null)
+                imm.showSoftInput(etAmount, InputMethodManager.SHOW_IMPLICIT);
+        });
+    }
+
+    private void loadPaymentTypes(String preselect) {
+        List<PaymentType> types = payDao.findAll();
+        ArrayAdapter<PaymentType> adp =
+                new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, types);
+        adp.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spPaymentType.setAdapter(adp);
+
+        int pos = 0;
+//        String target = (preselect != null && !preselect.isEmpty()) ? preselect : "UPI"; // default UPI
+        String target = preselect; // null unless editing an existing transaction
+        if (target == null || target.isEmpty()) {
+            for (PaymentType t : types)
+                if (t.isDefault()) {
+                    target = t.getName();
+                    break;
+                }
+        }
+        if (target == null) target = "UPI"; // last-resort fallback if nothing is marked default yet
+        for (int i = 0; i < types.size(); i++)
+            if (types.get(i).getName().equalsIgnoreCase(target)) {
+                pos = i;
+                break;
+            }
+        spPaymentType.setSelection(pos);
+        for (int i = 0; i < types.size(); i++)
+            if (types.get(i).getName().equalsIgnoreCase(target)) {
+                pos = i;
+                break;
+            }
+        spPaymentType.setSelection(pos);
+    }
+
+    private record PendingAttachment(String name, String mimeType, byte[] bytes) {
+    }
+
+    // ── Note -> past matching notes autocomplete ──────────────────
+    // Type panra letters-oda substring match panni, andha book-oda past
+    // notes-ah dropdown-ah kaatudhu (most recent first). Tap panna andha
+    // note-ah fill pannidum.
+    private void wireNoteSuggestions() {
+        noteSuggestAdapter = new NoteSuggestionAdapter(this, new ArrayList<>());
+        noteSuggestPopup = new ListPopupWindow(this);
+        noteSuggestPopup.setAnchorView(etNote);
+        noteSuggestPopup.setAdapter(noteSuggestAdapter);
+        noteSuggestPopup.setModal(false);
+        noteSuggestPopup.setInputMethodMode(ListPopupWindow.INPUT_METHOD_NEEDED);
+
+        etNote.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            // NEW — this was the actual missing piece: suppressNoteSuggestion was being
+// SET (in the popup's item-click handler) but never CHECKED here, so the
+// text change from etNote.setText(picked) always rescheduled
+// showNoteSuggestions(), reopening the very popup the user just dismissed.
+            @Override
+            public void afterTextChanged(Editable e) {
+                if (suppressNoteSuggestion) {
+                    suppressNoteSuggestion = false;
+                    return;
+                }
+                if (noteSuggestRunnable != null)
+                    noteSuggestHandler.removeCallbacks(noteSuggestRunnable);
+                String text = e.toString();
+                noteSuggestRunnable = () -> showNoteSuggestions(text);
+                noteSuggestHandler.postDelayed(noteSuggestRunnable, 250);
+            }
+        });
+
+        noteSuggestPopup.setOnItemClickListener((parent, view, position, id) -> {
+            String picked = noteSuggestAdapter.getItem(position);
+            if (picked != null) {
+                suppressNoteSuggestion = true;
+                etNote.setText(picked);
+                etNote.setSelection(picked.length());
+            }
+            noteSuggestPopup.dismiss();
+        });
+
+        etNote.setOnFocusChangeListener((v, hasFocus) -> {
+            if (!hasFocus) noteSuggestPopup.dismiss();
+        });
+    }
+
+    private void showNoteSuggestions(String text) {
+        String trimmed = text.trim();
+        if (trimmed.length() < 2 || !etNote.hasFocus()) {
+            noteSuggestPopup.dismiss();
+            return;
+        }
+        List<String> matches = txnDao.findDistinctNotesContaining(trimmed, bookId, 8);
+        // Already exact-ah type pannirukura ஒரே ஒரு match-ku dropdown redundant.
+        if (matches.isEmpty() || (matches.size() == 1 && matches.get(0).equalsIgnoreCase(trimmed))) {
+            noteSuggestPopup.dismiss();
+            return;
+        }
+        noteSuggestAdapter.clear();
+        noteSuggestAdapter.addAll(matches);
+        noteSuggestAdapter.setQuery(trimmed);
+        noteSuggestAdapter.notifyDataSetChanged();
+        noteSuggestPopup.show();
+    }
+}

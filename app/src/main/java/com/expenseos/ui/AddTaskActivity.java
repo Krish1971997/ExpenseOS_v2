@@ -1,0 +1,324 @@
+package com.expenseos.ui;
+
+import android.app.AlarmManager;
+import android.app.DatePickerDialog;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.Spinner;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+
+import com.expenseos.R;
+import com.expenseos.dao.EventDao;
+import com.expenseos.dao.TaskDao;
+import com.expenseos.model.Event;
+import com.expenseos.model.Task;
+import com.expenseos.scheduler.TaskAlarmScheduler;
+import com.expenseos.util.TaskColors;
+import com.expenseos.util.TimePickerHelper;
+
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+
+public class AddTaskActivity extends AppCompatActivity {
+
+    public static final String EXTRA_DATE = "date"; // yyyy-MM-dd, pre-fill when creating from a day tap
+    public static final String EXTRA_TASK_ID = "task_id"; // set when editing
+
+    private TaskDao taskDao;
+    private EventDao eventDao;
+    private long editingTaskId = 0;
+
+    private EditText etName, etDescription;
+    private Button btnDate, btnTime, btnEvents;
+    private TextView tvScheduleSummary;
+    private Spinner spColor;
+    private boolean colorManual = false; // true once the user touches the colour spinner
+    private LocalDate date;
+    private LocalTime time;
+    private List<Event> allEvents;
+    private final List<Long> selectedEventIds = new ArrayList<>();
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    private static final DateTimeFormatter TASK_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+
+    @Override
+    protected void onCreate(Bundle s) {
+        super.onCreate(s);
+        setContentView(R.layout.activity_add_task);
+        taskDao = new TaskDao(this);
+        eventDao = new EventDao(this);
+
+        etName = findViewById(R.id.etTaskName);
+        etDescription = findViewById(R.id.etTaskDescription);
+        btnDate = findViewById(R.id.btnTaskDate);
+        btnTime = findViewById(R.id.btnTaskTime);
+        btnEvents = findViewById(R.id.btnTaskEvents);
+        spColor = findViewById(R.id.spTaskColor);
+        tvScheduleSummary = findViewById(R.id.tvScheduleSummary);
+
+        allEvents = eventDao.findAll();
+        if (allEvents.isEmpty()) {
+            Toast.makeText(this, "Create an Event first (Integrations tab) before adding tasks", Toast.LENGTH_LONG).show();
+        }
+
+        setupColorSpinner();
+        spColor.setOnTouchListener((v, ev) -> {
+            colorManual = true;
+            return false;
+        });
+
+        String prefillDate = getIntent().getStringExtra(EXTRA_DATE);
+        date = prefillDate != null ? LocalDate.parse(prefillDate, DATE_FMT) : LocalDate.now();
+        time = LocalTime.of(9, 0);
+        refreshDateTimeButtons();
+        autoPickColor();
+
+        btnDate.setOnClickListener(v -> new DatePickerDialog(this, (p, y, m, d) -> {
+            date = LocalDate.of(y, m + 1, d);
+            refreshDateTimeButtons();
+            autoPickColor();
+        }, date.getYear(), date.getMonthValue() - 1, date.getDayOfMonth()).show());
+
+        btnTime.setOnClickListener(v ->
+                TimePickerHelper.show(this, getSupportFragmentManager(), time.getHour(), time.getMinute(), (h, min) -> {
+                    time = LocalTime.of(h, min);
+                    refreshDateTimeButtons();
+                }));
+
+        btnEvents.setOnClickListener(v -> showEventPicker());
+
+        findViewById(R.id.btnBack).setOnClickListener(v -> finish());
+        findViewById(R.id.btnSaveTask).setOnClickListener(v -> save());
+        com.expenseos.util.ScreenAnim.staggerIn((android.view.ViewGroup) findViewById(R.id.btnSaveTask).getParent());
+
+        editingTaskId = getIntent().getLongExtra(EXTRA_TASK_ID, 0);
+        if (editingTaskId > 0) loadForEdit();
+    }
+
+    private void setupColorSpinner() {
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this,
+                android.R.layout.simple_spinner_dropdown_item, TaskColors.names()) {
+            @Override
+            public View getView(int pos, View convertView, android.view.ViewGroup parent) {
+                View v = super.getView(pos, convertView, parent);
+                tintSwatch(v, getItem(pos));
+                return v;
+            }
+
+            @Override
+            public View getDropDownView(int pos, View convertView, android.view.ViewGroup parent) {
+                View v = super.getDropDownView(pos, convertView, parent);
+                tintSwatch(v, getItem(pos));
+                return v;
+            }
+
+            private void tintSwatch(View v, String name) {
+                String hex = TaskColors.hexFor(name);
+                if (v instanceof android.widget.TextView tv) {
+                    if (!hex.isEmpty()) {
+                        GradientDrawable dot = new GradientDrawable();
+                        dot.setShape(GradientDrawable.OVAL);
+                        dot.setColor(Color.parseColor(hex));
+                        dot.setSize(28, 28);
+                        tv.setCompoundDrawablesWithIntrinsicBounds(dot, null, null, null);
+                        tv.setCompoundDrawablePadding(16);
+                    } else {
+                        tv.setCompoundDrawablesWithIntrinsicBounds(null, null, null, null);
+                    }
+                }
+            }
+        };
+        spColor.setAdapter(adapter);
+    }
+
+    private void refreshDateTimeButtons() {
+        btnDate.setText(date.format(DateTimeFormatter.ofPattern("dd MMM yyyy")));
+        btnTime.setText(time.format(DateTimeFormatter.ofPattern("hh:mm a")));
+        refreshSummary();
+    }
+
+    /**
+     * Live "when will it ring" preview — updates on date / event changes.
+     */
+    private void refreshSummary() {
+        if (tvScheduleSummary == null) return;
+        tvScheduleSummary.setText(com.expenseos.util.ReminderSummary.build(this, date, selectedEventIds));
+    }
+
+    private void showEventPicker() {
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(32, 16, 32, 16);
+        List<CheckBox> boxes = new ArrayList<>();
+        for (Event e : allEvents) {
+            CheckBox cb = new CheckBox(this);
+            cb.setText(e.getName());
+            cb.setChecked(selectedEventIds.contains(e.getId()));
+            container.addView(cb);
+            boxes.add(cb);
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Select event(s)")
+                .setView(container)
+                .setPositiveButton("OK", (d, w) -> {
+                    selectedEventIds.clear();
+                    List<String> names = new ArrayList<>();
+                    for (int i = 0; i < boxes.size(); i++) {
+                        if (boxes.get(i).isChecked()) {
+                            selectedEventIds.add(allEvents.get(i).getId());
+                            names.add(allEvents.get(i).getName());
+                        }
+                    }
+                    btnEvents.setText(names.isEmpty() ? "Select event(s)" : String.join(", ", names));
+                    refreshSummary();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void loadForEdit() {
+        Task t = taskDao.findById(editingTaskId);
+        if (t == null) return;
+        etName.setText(t.getName());
+        etDescription.setText(t.getDescription());
+        spColor.setSelection(java.util.Arrays.asList(TaskColors.names()).indexOf(TaskColors.nameFor(t.getColor())));
+
+        java.time.LocalDateTime dt = java.time.LocalDateTime.parse(t.getTaskDateTime(), TASK_FMT);
+        date = dt.toLocalDate();
+        time = dt.toLocalTime();
+        refreshDateTimeButtons();
+
+        selectedEventIds.clear();
+        selectedEventIds.addAll(taskDao.findEventIds(editingTaskId));
+        List<String> names = new ArrayList<>();
+        for (Event e : allEvents) if (selectedEventIds.contains(e.getId())) names.add(e.getName());
+        btnEvents.setText(names.isEmpty() ? "Select event(s)" : String.join(", ", names));
+        refreshSummary();
+    }
+
+    private void save() {
+        String name = etName.getText().toString().trim();
+        if (name.isEmpty()) {
+            Toast.makeText(this, "Task name required", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (selectedEventIds.isEmpty()) {
+            Toast.makeText(this, "Select at least one event", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        Task t = new Task();
+        t.setId(editingTaskId);
+        t.setName(name);
+        t.setTaskDateTime(date.format(DATE_FMT) + " " + time.format(DateTimeFormatter.ofPattern("HH:mm")));
+        t.setDescription(etDescription.getText().toString().trim());
+        String colorName = (String) spColor.getSelectedItem();
+        t.setColor(TaskColors.hexFor(colorName));
+        t.setEventIds(selectedEventIds);
+
+        long taskId;
+        if (editingTaskId > 0) {
+            taskDao.update(t);
+            taskId = editingTaskId;
+        } else taskId = taskDao.insert(t);
+
+        int scheduled = TaskAlarmScheduler.scheduleForTask(this, taskId, t.getTaskDateTime(), selectedEventIds);
+        if (scheduled == 0) {
+            Toast.makeText(this, "No alarm/notification scheduled — all reminder times are already in the past",
+                    Toast.LENGTH_LONG).show();
+        }
+
+        // Android 14+ — without the exact-alarm grant alarms become inexact
+        // and can drift by minutes. Point the user to the system toggle once.
+        AlarmManager am = (AlarmManager) getSystemService(android.content.Context.ALARM_SERVICE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                && (am == null || !am.canScheduleExactAlarms())) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Allow exact alarms")
+                    .setMessage("Alarms and notifications may otherwise be delayed.\n\n" +
+                            "Settings → Permissions → Alarms & reminders → Allow")
+                    .setPositiveButton("Open settings", (d, w) -> {
+                        try {
+                            startActivity(new android.content.Intent(
+                                    android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                                    android.net.Uri.parse("package:" + getPackageName())));
+                        } catch (Exception ignored) {
+                        }
+                    })
+                    .setNegativeButton("Later", null)
+                    .show();
+        } else if (Build.VERSION.SDK_INT >= 34) {
+            android.app.NotificationManager nm = getSystemService(android.app.NotificationManager.class);
+            if (nm != null && !nm.canUseFullScreenIntent()) {
+                new AlertDialog.Builder(this)
+                        .setTitle("Allow full-screen alarms")
+                        .setMessage("Without this the alarm screen won't open on a locked phone.")
+                        .setPositiveButton("Open settings", (d, w) -> {
+                            try {
+                                startActivity(new android.content.Intent(
+                                        android.provider.Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                                        android.net.Uri.parse("package:" + getPackageName())));
+                            } catch (Exception ignored) {
+                            }
+                        })
+                        .setNegativeButton("Later", null)
+                        .show();
+            }
+        }
+
+        if (com.expenseos.sync.GoogleCalendarSyncManager.isSignedIn(this)) {
+            com.expenseos.sync.GoogleCalendarSyncManager.upsert(this, taskId, (ok, msg) -> {
+                if (!ok) Toast.makeText(this, "Google sync: " + msg, Toast.LENGTH_SHORT).show();
+            });
+        }
+
+        Toast.makeText(this, "Saved!", Toast.LENGTH_SHORT).show();
+        setResult(RESULT_OK);
+        finish();
+    }
+
+    /**
+     * New task only: pick a colour not yet used by that day's tasks (random among the least-used).
+     */
+    private void autoPickColor() {
+        if (colorManual || getIntent().getLongExtra(EXTRA_TASK_ID, 0) > 0) return;
+
+        java.util.Map<String, Integer> used = new java.util.HashMap<>();
+        for (Task t : taskDao.findByDate(date.format(DATE_FMT))) {
+            String c = t.getColor();
+            if (c != null && !c.isEmpty()) used.merge(c.toUpperCase(), 1, Integer::sum);
+        }
+
+        List<String> names = new ArrayList<>();
+        int min = Integer.MAX_VALUE;
+        for (String n : TaskColors.names()) {
+            String hex = TaskColors.hexFor(n);
+            if (hex.isEmpty()) continue;               // skip the "no colour" entry
+            int cnt = used.getOrDefault(hex.toUpperCase(), 0);
+            if (cnt < min) {
+                min = cnt;
+                names.clear();
+            }
+            if (cnt == min) names.add(n);
+        }
+        if (names.isEmpty()) return;
+
+        String pick = names.get(new java.util.Random().nextInt(names.size()));
+        spColor.setSelection(java.util.Arrays.asList(TaskColors.names()).indexOf(pick));
+    }
+}

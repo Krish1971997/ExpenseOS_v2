@@ -1,0 +1,859 @@
+package com.expenseos.ui;
+
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.LinearLayout;
+import android.widget.RadioGroup;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
+
+import com.expenseos.R;
+import com.expenseos.dao.CashBookDao;
+import com.expenseos.dao.CategoryDao;
+import com.expenseos.dao.PaymentTypeDao;
+import com.expenseos.dao.SubCategoryDao;
+import com.expenseos.dao.TransactionDao;
+import com.expenseos.model.Category;
+import com.expenseos.model.PaymentType;
+import com.expenseos.model.SubCategory;
+import com.expenseos.model.Transaction;
+import com.expenseos.model.TransactionFilter;
+import com.expenseos.util.DownloadsSaver;
+import com.expenseos.util.GmailSender;
+import com.expenseos.util.ReportGenerator;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+
+public class GenerateReportActivity extends AppCompatActivity {
+
+    private static final int REQ_STORAGE_PERM = 2001;
+    private static final DateTimeFormatter DAY_FMT = DateTimeFormatter.ofPattern("dd MMM yyyy");
+
+    private int bookId;
+    private String cashbookName;
+    private TransactionDao txnDao;
+    private CategoryDao catDao;
+    private SubCategoryDao subCatDao;
+
+    private TextView tvDuration, tvEntryType, tvCategory, tvSearchTerm, tvSubCategory, tvAmount, tvPaymentType;
+    private RadioGroup rgReportType;
+
+    // Filter state
+    private String durationLabel = "All Time";
+    private LocalDate dateFrom, dateTo;
+    private String entryType = null; // null=All, "INCOME", "EXPENSE"
+    private List<Category> allCategories = new ArrayList<>();
+    private final List<Integer> selectedCategoryIds = new ArrayList<>();
+    private List<SubCategory> allSubCategories = new ArrayList<>();
+    private List<PaymentType> allPaymentTypes = new ArrayList<>();
+    private final List<Integer> selectedSubCategoryIds = new ArrayList<>();
+    private String amountOp1 = null;
+    private BigDecimal amount1 = null;
+    private String amountOp2 = null;
+    private BigDecimal amount2 = null;
+    private String searchTerm = null;
+    private final List<String> selectedPaymentTypes = new ArrayList<>();
+
+    // Resumed after a storage-permission grant on API < 29
+    private String pendingAction; // "csv" or "pdf-save"
+
+    @Override
+    protected void onCreate(Bundle s) {
+        super.onCreate(s);
+        setContentView(R.layout.activity_generate_report);
+
+//        SharedPreferences prefs = getSharedPreferences("expenseos_prefs", MODE_PRIVATE);
+//        bookId = prefs.getInt("active_book_id", 0);
+        bookId = com.expenseos.util.AppConfig.get(this).getActiveBookId();
+        com.expenseos.model.CashBook activeBook = new CashBookDao(this).findById(bookId);
+        cashbookName = activeBook != null ? activeBook.getName() : "";
+        txnDao = new TransactionDao(this);
+        catDao = new CategoryDao(this);
+        subCatDao = new SubCategoryDao(this);
+
+        findViewById(R.id.btnBack).setOnClickListener(v -> finish());
+
+        tvDuration = findViewById(R.id.tvDuration);
+        tvEntryType = findViewById(R.id.tvEntryType);
+        tvCategory = findViewById(R.id.tvCategory);
+        tvSubCategory = findViewById(R.id.tvSubCategory);
+        tvAmount = findViewById(R.id.tvAmount);
+        tvSearchTerm = findViewById(R.id.tvSearchTerm);
+        tvPaymentType = findViewById(R.id.tvPaymentType);
+        rgReportType = findViewById(R.id.rgReportType);
+
+        findViewById(R.id.filterDuration).setOnClickListener(v -> showDurationDialog());
+        findViewById(R.id.filterType).setOnClickListener(v -> showEntryTypeDialog());
+        findViewById(R.id.filterCategory).setOnClickListener(v -> showCategoryDialog());
+        findViewById(R.id.filterSubCategory).setOnClickListener(v -> showSubCategoryDialog());
+        findViewById(R.id.filterAmount).setOnClickListener(v -> showAmountDialog());
+        findViewById(R.id.filterSearch).setOnClickListener(v -> showSearchDialog());
+        findViewById(R.id.filterPaymentType).setOnClickListener(v -> showPaymentTypeDialog());
+
+        findViewById(R.id.btnGenerateExcel).setOnClickListener(v -> showExcelOptionsSheet());
+        findViewById(R.id.btnGeneratePdf).setOnClickListener(v -> showPdfOptionsSheet());
+        findViewById(R.id.btnGenerateEmail).setOnClickListener(v -> showEmailDialog());
+
+        // Both types merged — a report can span income and expense, so the
+        // category picker shouldn't be locked to whatever Entry Type filter
+        // happens to be set separately.
+        allCategories = new ArrayList<>();
+        allCategories.addAll(catDao.findByType("INCOME", bookId));
+        allCategories.addAll(catDao.findByType("EXPENSE", bookId));
+
+        // Not scoped to selected category — matches the old app's own
+        // sub-category picker, which lists sub-categories across the board
+        // rather than only those under whatever category happens to be
+        // checked in the Category filter.
+        allSubCategories = subCatDao.findAll();
+        allPaymentTypes = new PaymentTypeDao(this).findAll();
+    }
+
+    // ── Duration filter ─────────────────────────────────────
+    private void showDurationDialog() {
+        String[] opts = {"All Time", "Today", "Yesterday", "This Month", "Last Month", "Single Day", "Date Range"};
+        new AlertDialog.Builder(this)
+                .setTitle("Select Date Filter")
+                .setItems(opts, (d, which) -> {
+                    switch (which) {
+                        case 0 -> {
+                            durationLabel = "All Time";
+                            dateFrom = null;
+                            dateTo = null;
+                            tvDuration.setText(durationLabel);
+                        }
+                        case 1 -> {
+                            durationLabel = "Today";
+                            dateFrom = dateTo = LocalDate.now();
+                            tvDuration.setText(durationLabel);
+                        }
+                        case 2 -> {
+                            durationLabel = "Yesterday";
+                            dateFrom = dateTo = LocalDate.now().minusDays(1);
+                            tvDuration.setText(durationLabel);
+                        }
+                        case 3 -> {
+                            YearMonth ym = YearMonth.now();
+                            dateFrom = ym.atDay(1);
+                            dateTo = ym.atEndOfMonth();
+                            durationLabel = "This Month";
+                            tvDuration.setText(durationLabel);
+                        }
+                        case 4 -> {
+                            YearMonth ym = YearMonth.now().minusMonths(1);
+                            dateFrom = ym.atDay(1);
+                            dateTo = ym.atEndOfMonth();
+                            durationLabel = "Last Month";
+                            tvDuration.setText(durationLabel);
+                        }
+                        case 5 -> pickSingleDay();
+                        case 6 -> pickDateRange();
+                    }
+                })
+                .show();
+    }
+
+    private void pickSingleDay() {
+        LocalDate base = LocalDate.now();
+        new android.app.DatePickerDialog(this, (view, y, m, day) -> {
+            dateFrom = dateTo = LocalDate.of(y, m + 1, day);
+            durationLabel = dateFrom.format(DAY_FMT);
+            tvDuration.setText(durationLabel);
+        }, base.getYear(), base.getMonthValue() - 1, base.getDayOfMonth()).show();
+    }
+
+    private void pickDateRange() {
+        LocalDate base = LocalDate.now();
+        new android.app.DatePickerDialog(this, (view, y1, m1, d1) -> {
+            LocalDate from = LocalDate.of(y1, m1 + 1, d1);
+            new android.app.DatePickerDialog(this, (view2, y2, m2, d2) -> {
+                LocalDate to = LocalDate.of(y2, m2 + 1, d2);
+                dateFrom = from;
+                dateTo = to;
+                durationLabel = from.format(DAY_FMT) + " - " + to.format(DAY_FMT);
+                tvDuration.setText(durationLabel);
+            }, base.getYear(), base.getMonthValue() - 1, base.getDayOfMonth()).show();
+        }, base.getYear(), base.getMonthValue() - 1, base.getDayOfMonth()).show();
+    }
+
+    // ── Entry Type filter ───────────────────────────────────
+    private void showEntryTypeDialog() {
+        String[] opts = {"All", "Income", "Expense"};
+        int sel = entryType == null ? 0 : ("INCOME".equals(entryType) ? 1 : 2);
+        new AlertDialog.Builder(this)
+                .setTitle("Entry Type")
+                .setSingleChoiceItems(opts, sel, (d, which) -> {
+                    entryType = which == 0 ? null : (which == 1 ? "INCOME" : "EXPENSE");
+                    tvEntryType.setText(opts[which]);
+                    d.dismiss();
+                })
+                .show();
+    }
+
+    // ── Category filter (multi-select) ──────────────────────
+    private void showCategoryDialog() {
+        if (allCategories.isEmpty()) {
+            Toast.makeText(this, "No categories found", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String[] names = new String[allCategories.size()];
+        boolean[] checked = new boolean[allCategories.size()];
+        for (int i = 0; i < allCategories.size(); i++) {
+            names[i] = allCategories.get(i).getName();
+            checked[i] = selectedCategoryIds.contains(allCategories.get(i).getId());
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Select Category Filter")
+                .setMultiChoiceItems(names, checked, (d, which, isChecked) -> checked[which] = isChecked)
+                .setPositiveButton("Apply", (d, w) -> {
+                    selectedCategoryIds.clear();
+                    int count = 0;
+                    for (int i = 0; i < checked.length; i++)
+                        if (checked[i]) {
+                            selectedCategoryIds.add(allCategories.get(i).getId());
+                            count++;
+                        }
+                    tvCategory.setText(count == 0 ? "All" : count + " selected");
+                })
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Clear", (d, w) -> {
+                    selectedCategoryIds.clear();
+                    tvCategory.setText("All");
+                })
+                .show();
+    }
+
+    // ── Sub Category filter (multi-select) ──────────────────
+    private void showSubCategoryDialog() {
+        if (allSubCategories.isEmpty()) {
+            Toast.makeText(this, "No sub categories found", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String[] names = new String[allSubCategories.size()];
+        boolean[] checked = new boolean[allSubCategories.size()];
+        for (int i = 0; i < allSubCategories.size(); i++) {
+            names[i] = allSubCategories.get(i).getName();
+            checked[i] = selectedSubCategoryIds.contains(allSubCategories.get(i).getId());
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Select Sub Category Filter")
+                .setMultiChoiceItems(names, checked, (d, which, isChecked) -> checked[which] = isChecked)
+                .setPositiveButton("Apply", (d, w) -> {
+                    selectedSubCategoryIds.clear();
+                    int count = 0;
+                    for (int i = 0; i < checked.length; i++)
+                        if (checked[i]) {
+                            selectedSubCategoryIds.add(allSubCategories.get(i).getId());
+                            count++;
+                        }
+                    tvSubCategory.setText(count == 0 ? "All" : count + " selected");
+                })
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Clear", (d, w) -> {
+                    selectedSubCategoryIds.clear();
+                    tvSubCategory.setText("All");
+                })
+                .show();
+    }
+
+    // ── Amount filter — operator + value, optional second AND clause,
+    // e.g. ">=10 AND <=50" for a range ─────────────────────
+    private void showAmountDialog() {
+        String[] ops = {"=", ">", ">=", "<", "<="};
+        String[] ops2 = {"(none)", "AND >", "AND >=", "AND <", "AND <="};
+
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(dp(20), dp(12), dp(20), dp(4));
+
+        android.widget.Spinner spOp1 = new android.widget.Spinner(this);
+        spOp1.setAdapter(new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, ops));
+        int op1Pos = amountOp1 == null ? 0 : java.util.Arrays.asList(ops).indexOf(amountOp1);
+        spOp1.setSelection(Math.max(0, op1Pos));
+        container.addView(spOp1);
+
+        android.widget.EditText etAmount1 = new android.widget.EditText(this);
+        etAmount1.setHint("Amount");
+        etAmount1.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        if (amount1 != null) etAmount1.setText(amount1.toPlainString());
+        container.addView(etAmount1);
+
+        TextView andLabel = new TextView(this);
+        andLabel.setText("Range end (optional)");
+        andLabel.setPadding(0, dp(16), 0, 0);
+        andLabel.setTextColor(getColor(R.color.text_secondary));
+        container.addView(andLabel);
+
+        android.widget.Spinner spOp2 = new android.widget.Spinner(this);
+        spOp2.setAdapter(new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_item, ops2));
+        int op2Pos = amountOp2 == null ? 0 : java.util.Arrays.asList(ops2).indexOf("AND " + amountOp2);
+        spOp2.setSelection(Math.max(0, op2Pos));
+        container.addView(spOp2);
+
+        android.widget.EditText etAmount2 = new android.widget.EditText(this);
+        etAmount2.setHint("Range end");
+        etAmount2.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        if (amount2 != null) etAmount2.setText(amount2.toPlainString());
+        container.addView(etAmount2);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Amount")
+                .setView(container)
+                .setPositiveButton("Apply", (d, w) -> {
+                    String v1 = etAmount1.getText().toString().trim();
+                    if (v1.isEmpty()) {
+                        amountOp1 = null;
+                        amount1 = null;
+                        amountOp2 = null;
+                        amount2 = null;
+                        tvAmount.setText("All");
+                        return;
+                    }
+                    amountOp1 = ops[spOp1.getSelectedItemPosition()];
+                    amount1 = new BigDecimal(v1);
+
+                    String v2 = etAmount2.getText().toString().trim();
+                    int sel2 = spOp2.getSelectedItemPosition();
+                    if (sel2 > 0 && !v2.isEmpty()) {
+                        amountOp2 = ops2[sel2].replace("AND ", "");
+                        amount2 = new BigDecimal(v2);
+                        tvAmount.setText(amountOp1 + amount1.toPlainString() + " " + amountOp2 + amount2.toPlainString());
+                    } else {
+                        amountOp2 = null;
+                        amount2 = null;
+                        tvAmount.setText(amountOp1 + amount1.toPlainString());
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Clear", (d, w) -> {
+                    amountOp1 = null;
+                    amount1 = null;
+                    amountOp2 = null;
+                    amount2 = null;
+                    tvAmount.setText("All");
+                })
+                .show();
+    }
+
+    private void showSearchDialog() {
+        android.widget.EditText input = new android.widget.EditText(this);
+        input.setHint("Search by remark or amount");
+        if (searchTerm != null) input.setText(searchTerm);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Search Term")
+                .setView(input)
+                .setPositiveButton("Apply", (d, w) -> {
+                    String q = input.getText().toString().trim();
+                    searchTerm = q.isEmpty() ? null : q;
+                    tvSearchTerm.setText(searchTerm == null ? "None" : searchTerm);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void showPaymentTypeDialog() {
+        if (allPaymentTypes.isEmpty()) {
+            Toast.makeText(this, "No payment types found", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        String[] names = new String[allPaymentTypes.size()];
+        boolean[] checked = new boolean[allPaymentTypes.size()];
+        for (int i = 0; i < allPaymentTypes.size(); i++) {
+            names[i] = allPaymentTypes.get(i).getName();
+            checked[i] = selectedPaymentTypes.contains(names[i]);
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Payment Type")
+                .setMultiChoiceItems(names, checked, (d, which, isChecked) -> checked[which] = isChecked)
+                .setPositiveButton("Apply", (d, w) -> {
+                    selectedPaymentTypes.clear();
+                    for (int i = 0; i < checked.length; i++) {
+                        if (checked[i]) {
+                            selectedPaymentTypes.add(names[i]);
+                        }
+                    }
+                    tvPaymentType.setText(selectedPaymentTypes.isEmpty() ? "All" : String.join(", ", selectedPaymentTypes));
+                })
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Clear", (d, w) -> {
+                    selectedPaymentTypes.clear();
+                    tvPaymentType.setText("All");
+                })
+                .show();
+    }
+
+    // ── Build the filtered transaction list for the report ──
+    private List<Transaction> loadFilteredTransactions() {
+        TransactionFilter f = new TransactionFilter();
+        f.setBookId(bookId);
+        f.setType(entryType);
+        f.setDateFrom(dateFrom);
+        f.setDateTo(dateTo);
+        f.setNoteSearch(searchTerm);
+        f.setPaymentTypes(selectedPaymentTypes.isEmpty() ? null : new ArrayList<>(selectedPaymentTypes));
+        f.setCategoryIds(selectedCategoryIds.isEmpty() ? null : new ArrayList<>(selectedCategoryIds));
+        f.setSubCategoryIds(selectedSubCategoryIds.isEmpty() ? null : new ArrayList<>(selectedSubCategoryIds));
+        f.setAmountOp1(amountOp1);
+        f.setAmount1(amount1);
+        f.setAmountOp2(amountOp2);
+        f.setAmount2(amount2);
+        f.setSortBy("date");
+        f.setSortDir("asc");
+        f.setPageSize(Integer.MAX_VALUE);
+        return txnDao.findByFilter(f);
+    }
+
+    private String currentReportType() {
+        int id = rgReportType.getCheckedRadioButtonId();
+        if (id == R.id.rbDaywise) return ReportGenerator.TYPE_DAYWISE;
+        if (id == R.id.rbCategorywise) return ReportGenerator.TYPE_CATEGORYWISE;
+        if (id == R.id.rbSubcategorywise) return ReportGenerator.TYPE_SUBCATEGORYWISE;
+        if (id == R.id.rbPaymenttypewise)
+            return ReportGenerator.TYPE_PAYMENTTYPEWISE; // 👈 Check rbPaymenttypewise
+        return ReportGenerator.TYPE_ALL;
+    }
+
+    // NEW — mirrors the PDF bottom sheet: Show Preview (opens in Excel via
+// FileProvider) or Save to Downloads Folder.
+    // ── Excel (CSV) — Show Preview / Save to Downloads Folder ───────
+// NEW — real .xlsx now (was CSV), same Show-Preview/Save pattern
+    private static final String XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+    // ── Excel (.xlsx) — Show Preview / Save to Downloads Folder ───────
+    private void showExcelOptionsSheet() {
+        com.google.android.material.bottomsheet.BottomSheetDialog sheet =
+                new com.google.android.material.bottomsheet.BottomSheetDialog(this);
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(0, dp(8), 0, dp(16));
+
+        TextView title = new TextView(this);
+        title.setText("Excel report");
+        title.setTextSize(16);
+        title.setTypeface(null, android.graphics.Typeface.BOLD);
+        title.setPadding(dp(20), dp(12), dp(20), dp(12));
+        container.addView(title);
+
+        container.addView(sheetOption("👁", "Show Preview", () -> {
+            sheet.dismiss();
+            previewExcel();
+        }));
+        container.addView(sheetOption("⬇", "Save to Downloads Folder", () -> {
+            sheet.dismiss();
+            if (ensureStoragePermission("csv")) generateExcel();
+        }));
+
+        sheet.setContentView(container);
+        sheet.show();
+    }
+
+    private void previewExcel() {
+        try {
+            List<Transaction> txns = loadFilteredTransactions();
+            String reportType = currentReportType();
+
+            File dir = new File(getCacheDir(), "reports");
+            if (!dir.exists()) dir.mkdirs();
+            File xlsxFile = new File(dir, "preview_" + System.currentTimeMillis() + ".xlsx");
+            try (FileOutputStream out = new FileOutputStream(xlsxFile)) {
+                ReportGenerator.writeXlsx(txns, reportType, out);
+            }
+
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", xlsxFile);
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, XLSX_MIME);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            try {
+                startActivity(intent);
+            } catch (android.content.ActivityNotFoundException e) {
+                Toast.makeText(this, "No app found to open Excel files", Toast.LENGTH_LONG).show();
+            }
+        } catch (Exception e) {
+            Toast.makeText(this, "Couldn't generate preview: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void generateExcel() {
+        List<Transaction> txns = loadFilteredTransactions();
+        String reportType = currentReportType();
+        String fileName = "Report_" + reportType + "_" + System.currentTimeMillis() + ".xlsx";
+        try {
+            DownloadsSaver.Result result = DownloadsSaver.save(this, fileName, XLSX_MIME,
+                    out -> ReportGenerator.writeXlsx(txns, reportType, out));
+            Toast.makeText(this, "Saved to " + result.displayLocation, Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    // Sends straight to the address configured in Config
+    // (scheduler.alert.email) — no confirm dialog, no manual typing.
+    // Matches StatsActivity's Email button behavior.
+    private void showEmailDialog() {
+        String configuredEmail = com.expenseos.util.AppConfig.get(this).getSchedulerAlertEmail();
+        if (configuredEmail == null || configuredEmail.isBlank()) {
+            Toast.makeText(this,
+                    "No email configured — set it under Config first.",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        sendEmail(configuredEmail);
+    }
+
+    private void sendEmail(String toAddress) {
+        Toast.makeText(this, "Sending…", Toast.LENGTH_SHORT).show();
+        List<Transaction> txns = loadFilteredTransactions();
+        String reportType = currentReportType();
+        String title = defaultReportTitle();
+
+        new Thread(() -> {
+            try {
+                ByteArrayOutputStream pdfBytes = new ByteArrayOutputStream();
+                ReportGenerator.writePdf(txns, reportType, cashbookName, title, pdfBytes);
+
+                String subject = title + " — " + cashbookName;
+                String html = buildReportEmailHtml(title, reportType, txns);
+                GmailSender.Attachment attachment = new GmailSender.Attachment(
+                        "report.pdf", pdfBytes.toByteArray(), "application/pdf");
+
+                GmailSender.send(this, toAddress, subject, html, attachment);
+                runOnUiThread(() -> Toast.makeText(this, "✔ Email sent!", Toast.LENGTH_SHORT).show());
+            } catch (Exception e) {
+                String msg = e.getMessage() != null ? e.getMessage() : e.toString();
+                runOnUiThread(() -> Toast.makeText(this, "✘ Send failed: " + msg, Toast.LENGTH_LONG).show());
+            }
+        }).start();
+    }
+
+    // Full report content rendered directly in the email body — structure
+    // now matches the selected report type (same grouping the PDF/Excel
+    // generators use), not just a flat "all entries" listing regardless
+    // of what the user picked.
+    private String buildReportEmailHtml(String title, String reportType, List<Transaction> txns) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<html><body style='font-family:Arial,sans-serif;'>");
+        sb.append("<h2>").append(title).append("</h2>");
+        sb.append("<p style='color:#666;'>Cashbook: ").append(cashbookName).append("</p>");
+        sb.append("<p style='color:#888;font-size:12px;'>").append(txns.size()).append(" entries</p>");
+
+        java.math.BigDecimal income = java.math.BigDecimal.ZERO, expense = java.math.BigDecimal.ZERO;
+        for (Transaction t : txns) {
+            java.math.BigDecimal amt = t.getAmount() != null ? t.getAmount() : java.math.BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) income = income.add(amt);
+            else expense = expense.add(amt);
+        }
+        sb.append("<p><b>Income:</b> ₹").append(income.toPlainString())
+                .append(" &nbsp;&nbsp; <b>Expense:</b> ₹").append(expense.toPlainString())
+                .append(" &nbsp;&nbsp; <b>Net:</b> ₹").append(income.subtract(expense).toPlainString())
+                .append("</p>");
+
+        switch (reportType) {
+            case ReportGenerator.TYPE_DAYWISE -> appendDaywiseTable(sb, txns);
+            case ReportGenerator.TYPE_CATEGORYWISE -> appendCategorywiseTable(sb, txns);
+            case ReportGenerator.TYPE_SUBCATEGORYWISE -> appendSubcategorywiseTable(sb, txns);
+            case ReportGenerator.TYPE_PAYMENTTYPEWISE -> appendPaymentTypewiseTable(sb, txns);
+            default -> appendAllEntriesTable(sb, txns);
+        }
+
+        sb.append("<p style='color:#888;font-size:12px;margin-top:16px;'>A PDF copy of this report is attached.</p>");
+        sb.append("</body></html>");
+        return sb.toString();
+    }
+
+    private void tableHeader(StringBuilder sb, String... cols) {
+        sb.append("<table style='border-collapse:collapse;width:100%;max-width:520px;'>");
+        sb.append("<tr style='background:#2563EB;color:#fff;'>");
+        for (int i = 0; i < cols.length; i++) {
+            boolean numeric = i > 0; // first column is always the label — everything after is right-aligned
+            sb.append("<th style='padding:6px;text-align:").append(numeric ? "right" : "left").append(";'>")
+                    .append(cols[i]).append("</th>");
+        }
+        sb.append("</tr>");
+    }
+
+    private void appendAllEntriesTable(StringBuilder sb, List<Transaction> txns) {
+        tableHeader(sb, "Date", "Category", "Note", "Amount");
+        java.time.format.DateTimeFormatter fmt = java.time.format.DateTimeFormatter.ofPattern("dd MMM");
+        int shown = 0;
+        for (Transaction t : txns) {
+            if (shown >= 100)
+                break; // keep the email body reasonably sized — full detail is in the attached PDF
+            boolean isIncome = t.getType() == Transaction.Type.INCOME;
+            sb.append("<tr style='border-bottom:1px solid #eee;'>")
+                    .append("<td style='padding:6px;'>").append(t.getDateTime() != null ? t.getDateTime().format(fmt) : "").append("</td>")
+                    .append("<td style='padding:6px;'>").append(t.getCategoryName() != null ? t.getCategoryName() : "").append("</td>")
+                    .append("<td style='padding:6px;'>").append(t.getNote() != null ? t.getNote() : "").append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:").append(isIncome ? "#2E7D32" : "#C0392B").append(";'>")
+                    .append(isIncome ? "+" : "-").append("₹").append(t.getAmount() != null ? t.getAmount().toPlainString() : "0").append("</td>")
+                    .append("</tr>");
+            shown++;
+        }
+        sb.append("</table>");
+        if (txns.size() > 100) {
+            sb.append("<p style='color:#888;font-size:12px;'>Showing first 100 of ").append(txns.size()).append(" entries — see attached PDF for the full list.</p>");
+        }
+    }
+
+    private void appendDaywiseTable(StringBuilder sb, List<Transaction> txns) {
+        java.util.Map<java.time.LocalDate, java.math.BigDecimal[]> byDate = new java.util.TreeMap<>();
+        for (Transaction t : txns) {
+            if (t.getDateTime() == null) continue;
+            java.time.LocalDate d = t.getDateTime().toLocalDate();
+            java.math.BigDecimal[] pair = byDate.computeIfAbsent(d, k -> new java.math.BigDecimal[]{java.math.BigDecimal.ZERO, java.math.BigDecimal.ZERO});
+            java.math.BigDecimal amt = t.getAmount() != null ? t.getAmount() : java.math.BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) pair[0] = pair[0].add(amt);
+            else pair[1] = pair[1].add(amt);
+        }
+        tableHeader(sb, "Date", "Income", "Expense", "Balance");
+        java.time.format.DateTimeFormatter fmt = java.time.format.DateTimeFormatter.ofPattern("dd MMM yyyy");
+        for (var e : byDate.entrySet()) {
+            java.math.BigDecimal bal = e.getValue()[0].subtract(e.getValue()[1]);
+            sb.append("<tr style='border-bottom:1px solid #eee;'>")
+                    .append("<td style='padding:6px;'>").append(e.getKey().format(fmt)).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:#2E7D32;'>₹").append(e.getValue()[0].toPlainString()).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:#C0392B;'>₹").append(e.getValue()[1].toPlainString()).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;'>₹").append(bal.toPlainString()).append("</td>")
+                    .append("</tr>");
+        }
+        sb.append("</table>");
+    }
+
+    private void appendCategorywiseTable(StringBuilder sb, List<Transaction> txns) {
+        java.util.Map<String, java.math.BigDecimal[]> byCat = new java.util.TreeMap<>();
+        for (Transaction t : txns) {
+            String cat = t.getCategoryName() != null ? t.getCategoryName() : "Uncategorized";
+            java.math.BigDecimal[] pair = byCat.computeIfAbsent(cat, k -> new java.math.BigDecimal[]{java.math.BigDecimal.ZERO, java.math.BigDecimal.ZERO});
+            java.math.BigDecimal amt = t.getAmount() != null ? t.getAmount() : java.math.BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) pair[0] = pair[0].add(amt);
+            else pair[1] = pair[1].add(amt);
+        }
+        tableHeader(sb, "Category", "Income", "Expense");
+        for (var e : byCat.entrySet()) {
+            sb.append("<tr style='border-bottom:1px solid #eee;'>")
+                    .append("<td style='padding:6px;'>").append(e.getKey()).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:#2E7D32;'>₹").append(e.getValue()[0].toPlainString()).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:#C0392B;'>₹").append(e.getValue()[1].toPlainString()).append("</td>")
+                    .append("</tr>");
+        }
+        sb.append("</table>");
+    }
+
+    private void appendSubcategorywiseTable(StringBuilder sb, List<Transaction> txns) {
+        java.util.Map<String, java.math.BigDecimal[]> bySubcat = new java.util.TreeMap<>();
+        for (Transaction t : txns) {
+            String cat = t.getCategoryName() != null ? t.getCategoryName() : "Uncategorized";
+            String sub = t.getSubCategoryName() != null && !t.getSubCategoryName().isEmpty() ? t.getSubCategoryName() : "—";
+            String key = cat + " / " + sub;
+            java.math.BigDecimal[] pair = bySubcat.computeIfAbsent(key, k -> new java.math.BigDecimal[]{java.math.BigDecimal.ZERO, java.math.BigDecimal.ZERO});
+            java.math.BigDecimal amt = t.getAmount() != null ? t.getAmount() : java.math.BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) pair[0] = pair[0].add(amt);
+            else pair[1] = pair[1].add(amt);
+        }
+        tableHeader(sb, "Category / Sub-Category", "Income", "Expense");
+        for (var e : bySubcat.entrySet()) {
+            sb.append("<tr style='border-bottom:1px solid #eee;'>")
+                    .append("<td style='padding:6px;'>").append(e.getKey()).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:#2E7D32;'>₹").append(e.getValue()[0].toPlainString()).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:#C0392B;'>₹").append(e.getValue()[1].toPlainString()).append("</td>")
+                    .append("</tr>");
+        }
+        sb.append("</table>");
+    }
+
+    private void appendPaymentTypewiseTable(StringBuilder sb, List<Transaction> txns) {
+        java.util.Map<String, java.math.BigDecimal[]> byPt = new java.util.TreeMap<>();
+        for (Transaction t : txns) {
+            String pt = t.getPaymentType() != null && !t.getPaymentType().isEmpty() ? t.getPaymentType() : "Unspecified";
+            java.math.BigDecimal[] pair = byPt.computeIfAbsent(pt, k -> new java.math.BigDecimal[]{java.math.BigDecimal.ZERO, java.math.BigDecimal.ZERO});
+            java.math.BigDecimal amt = t.getAmount() != null ? t.getAmount() : java.math.BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) pair[0] = pair[0].add(amt);
+            else pair[1] = pair[1].add(amt);
+        }
+        tableHeader(sb, "Payment Type", "Income", "Expense");
+        for (var e : byPt.entrySet()) {
+            sb.append("<tr style='border-bottom:1px solid #eee;'>")
+                    .append("<td style='padding:6px;'>").append(e.getKey()).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:#2E7D32;'>₹").append(e.getValue()[0].toPlainString()).append("</td>")
+                    .append("<td style='padding:6px;text-align:right;color:#C0392B;'>₹").append(e.getValue()[1].toPlainString()).append("</td>")
+                    .append("</tr>");
+        }
+        sb.append("</table>");
+    }
+
+    // ── PDF — Show Preview / Save to Downloads Folder ───────
+
+    private void showPdfOptionsSheet() {
+        com.google.android.material.bottomsheet.BottomSheetDialog sheet =
+                new com.google.android.material.bottomsheet.BottomSheetDialog(this);
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        container.setPadding(0, dp(8), 0, dp(16));
+
+        TextView title = new TextView(this);
+        title.setText("PDF report");
+        title.setTextSize(16);
+        title.setTypeface(null, android.graphics.Typeface.BOLD);
+        title.setPadding(dp(20), dp(12), dp(20), dp(12));
+        container.addView(title);
+
+        // Editable header/title — defaults to the report type's usual title,
+        // but the user can rename it (e.g. "August 2026 Expense Report")
+        // before either preview or save.
+        android.widget.EditText etTitle = new android.widget.EditText(this);
+        etTitle.setHint("Report title (optional)");
+        etTitle.setText(defaultReportTitle());
+        LinearLayout.LayoutParams etLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        etLp.leftMargin = dp(20);
+        etLp.rightMargin = dp(20);
+        etLp.bottomMargin = dp(8);
+        etTitle.setLayoutParams(etLp);
+        container.addView(etTitle);
+
+        container.addView(sheetOption("👁", "Show Preview", () -> {
+            sheet.dismiss();
+            previewPdf(etTitle.getText().toString());
+        }));
+        container.addView(sheetOption("⬇", "Save to Downloads Folder", () -> {
+            sheet.dismiss();
+            String customTitle = etTitle.getText().toString();
+            if (ensureStoragePermission("pdf-save")) savePdfToDownloads(customTitle);
+        }));
+
+        sheet.setContentView(container);
+        sheet.show();
+    }
+
+    private String defaultReportTitle() {
+        return switch (currentReportType()) {
+            case ReportGenerator.TYPE_DAYWISE -> "Day-wise Summary";
+            case ReportGenerator.TYPE_CATEGORYWISE -> "Category-wise Summary";
+            case ReportGenerator.TYPE_SUBCATEGORYWISE -> "Sub Category-wise Summary";
+            case ReportGenerator.TYPE_PAYMENTTYPEWISE -> "Payment Type-wise Summary";
+            default -> "All Entries Report";
+        };
+    }
+
+    private View sheetOption(String emoji, String label, Runnable onClick) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(20), dp(14), dp(20), dp(14));
+        row.setClickable(true);
+        row.setFocusable(true);
+        android.util.TypedValue outValue = new android.util.TypedValue();
+        getTheme().resolveAttribute(android.R.attr.selectableItemBackground, outValue, true);
+        row.setBackgroundResource(outValue.resourceId);
+
+        TextView tvEmoji = new TextView(this);
+        tvEmoji.setText(emoji);
+        tvEmoji.setTextSize(18);
+        tvEmoji.setLayoutParams(new LinearLayout.LayoutParams(dp(32), LinearLayout.LayoutParams.WRAP_CONTENT));
+        row.addView(tvEmoji);
+
+        TextView tvLabel = new TextView(this);
+        tvLabel.setText(label);
+        tvLabel.setTextSize(16);
+        tvLabel.setTextColor(getColor(R.color.text_primary));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        lp.leftMargin = dp(16);
+        tvLabel.setLayoutParams(lp);
+        row.addView(tvLabel);
+
+        row.setOnClickListener(v -> onClick.run());
+        return row;
+    }
+
+    private int dp(int v) {
+        return (int) (v * getResources().getDisplayMetrics().density);
+    }
+
+    private void previewPdf(String customTitle) {
+        try {
+            List<Transaction> txns = loadFilteredTransactions();
+            String reportType = currentReportType();
+
+            File dir = new File(getCacheDir(), "reports");
+            if (!dir.exists()) dir.mkdirs();
+            File pdfFile = new File(dir, "preview_" + System.currentTimeMillis() + ".pdf");
+            try (FileOutputStream out = new FileOutputStream(pdfFile)) {
+                ReportGenerator.writePdf(txns, reportType, cashbookName, customTitle, out);
+            }
+
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", pdfFile);
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, "application/pdf");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "Couldn't generate preview: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void savePdfToDownloads(String customTitle) {
+        List<Transaction> txns = loadFilteredTransactions();
+        String reportType = currentReportType();
+        String fileName = "Report_" + reportType + "_" + System.currentTimeMillis() + ".pdf";
+        try {
+            DownloadsSaver.Result result = DownloadsSaver.save(this, fileName, "application/pdf",
+                    out -> ReportGenerator.writePdf(txns, reportType, cashbookName, customTitle, out));
+            Toast.makeText(this, "Saved to " + result.displayLocation, Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            Toast.makeText(this, "Failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    // ── Storage permission (API 26-28 only — API 29+ uses MediaStore,
+    // which needs no permission at all) ─────────────────────
+    private boolean ensureStoragePermission(String action) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return true;
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED) return true;
+
+        pendingAction = action;
+        ActivityCompat.requestPermissions(this,
+                new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE_PERM);
+        return false;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_STORAGE_PERM) return;
+
+// NEW — permission grant resumes the save flow with the default title since
+// the custom-title EditText from the bottom sheet is gone by this point.
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            if ("csv".equals(pendingAction)) generateExcel();
+            else if ("pdf-save".equals(pendingAction)) savePdfToDownloads(defaultReportTitle());
+        } else {
+            Toast.makeText(this, "Storage permission needed to save to Downloads", Toast.LENGTH_SHORT).show();
+        }
+        pendingAction = null;
+    }
+}

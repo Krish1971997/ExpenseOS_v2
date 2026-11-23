@@ -1,0 +1,620 @@
+package com.expenseos.sync;
+
+import android.content.ContentValues;
+import android.content.Context;
+import android.database.Cursor;
+import android.database.CursorWindow;
+import android.database.sqlite.SQLiteDatabase;
+import android.os.Build;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+
+import com.expenseos.cloud.FileCrypto;
+import com.expenseos.dao.LocalDatabase;
+import com.expenseos.util.ConsoleLogger;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
+
+/**
+ * Creates ZIP backups (JSON + receipt BLOBs), saves LOCAL or uploads to Zoho
+ * WorkDrive (CLOUD), and restores from either source.
+ */
+public class BackupManager {
+
+    public enum BackupMode {LOCAL, CLOUD}
+
+    public interface BackupCallback {
+        void onComplete(boolean success, String message, File file);
+    }
+
+    private static BackupManager instance;
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ConsoleLogger log = ConsoleLogger.get();
+
+    private static final int MAX_CLOUD_BACKUPS = 30;
+
+    public static BackupManager get() {
+        if (instance == null) instance = new BackupManager();
+        return instance;
+    }
+
+    // ── CREATE BACKUP ─────────────────────────────────────────────────────────
+    public void createBackup(Context ctx, String description, BackupMode mode, BackupCallback cb) {
+        executor.execute(() -> {
+            log.info("Creating backup (mode=" + mode + ")...");
+            try {
+                SQLiteDatabase db = LocalDatabase.get(ctx).getReadableDatabase();
+
+                JSONObject backup = new JSONObject();
+                backup.put("version", 3);
+                backup.put("created_at", new SimpleDateFormat(
+                        "yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date()));
+                backup.put("description", description != null ? description : "");
+                backup.put("transactions", tableToJson(db, "transactions"));
+                backup.put("categories", tableToJson(db, "categories"));
+                backup.put("sub_categories", tableToJson(db, "sub_categories"));
+                backup.put("cash_books", tableToJson(db, "cash_books"));
+                backup.put("transaction_receipts", receiptsMetaToJson(db)); // metadata only, no BLOB
+
+                // ── Remaining tables from the full TABLES list ──────────────
+                backup.put("column_definitions", tableToJson(db, "column_definitions"));
+                backup.put("transaction_custom_values", tableToJson(db, "transaction_custom_values"));
+                backup.put("transaction_audit_log", tableToJson(db, "transaction_audit_log"));
+                backup.put("budgets", tableToJson(db, "budgets"));
+                backup.put("budget_categories", tableToJson(db, "budget_categories"));
+                backup.put("schedulers", tableToJson(db, "schedulers"));
+                backup.put("scheduler_log", tableToJson(db, "scheduler_log"));
+                backup.put("deleted_records", tableToJson(db, "deleted_records"));
+                backup.put("payment_types", tableToJson(db, "payment_types"));
+                backup.put("keyword_mappings", tableToJson(db, "keyword_mappings"));
+                backup.put("events", tableToJson(db, "events"));
+                backup.put("reminders", tableToJson(db, "reminders"));
+                backup.put("event_reminders", tableToJson(db, "event_reminders"));
+                backup.put("tasks", tableToJson(db, "tasks"));
+                backup.put("task_events", tableToJson(db, "task_events"));
+                backup.put("task_alarms", tableToJson(db, "task_alarms"));
+
+                // ── NEW: Added Tables from LocalDB ──
+                backup.put("passbook_entries", tableToJson(db, "passbook_entries"));
+                backup.put("budget_allocation_template", tableToJson(db, "budget_allocation_template"));
+                backup.put("recycle_bin", tableToJson(db, "recycle_bin"));
+                backup.put("app_config", tableToJson(db, "app_config"));
+                backup.put("ai_chat_messages", tableToJson(db, "ai_chat_messages"));
+                backup.put("settlement_links", tableToJson(db, "settlement_links"));
+                if (com.expenseos.sync.CloudLock.getSalt(ctx) != null)
+                    backup.put("cloud_salt", com.expenseos.sync.CloudLock.getSalt(ctx));
+                backup.put("import_log", tableToJson(db, "import_log"));
+                backup.put("card_mappings", tableToJson(db, "card_mappings"));
+
+                String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(new Date());
+                String fileName = "backup_" + ts + ".zip";
+                File tempZip = new File(ctx.getCacheDir(), fileName);
+
+                try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(tempZip))) {
+                    zos.putNextEntry(new ZipEntry("backup_data.json"));
+                    zos.write(backup.toString(2).getBytes(StandardCharsets.UTF_8));
+                    zos.closeEntry();
+                    writeReceiptsToZip(ctx, db, zos);
+                }
+
+                long size = tempZip.length();
+                int incomeCount = countRows(db, "transactions", "type='INCOME'");
+                int expenseCount = countRows(db, "transactions", "type='EXPENSE'");
+
+                String finalPath;
+                String externalId = null;
+
+                if (mode == BackupMode.CLOUD) {
+                    WorkDriveApiService wds = new WorkDriveApiService(ctx);
+                    externalId = wds.uploadFile(tempZip);
+                    if (externalId == null || externalId.isEmpty())
+                        throw new Exception("Cloud upload failed — no resource id returned");
+                    tempZip.delete(); // no local copy kept for CLOUD backups
+                    finalPath = "";
+
+                    pruneOldCloudBackups(ctx, wds);   // <-- new: keep only latest 30
+
+                } else {
+                    File destFile = new File(getBackupDir(ctx), fileName);
+                    copyFile(tempZip, destFile);
+                    tempZip.delete();
+                    finalPath = destFile.getAbsolutePath();
+                }
+
+                logBackupHistory(ctx, fileName, finalPath, size, "MANUAL", mode.name(),
+                        "SUCCESS", description, incomeCount, expenseCount, externalId);
+
+                log.success("Backup created (" + mode + "): " + fileName);
+                File resultFile = mode == BackupMode.LOCAL ? new File(finalPath) : null;
+                String msg = mode == BackupMode.CLOUD ? "Uploaded to cloud: " + fileName : "Backup saved: " + fileName;
+                mainHandler.post(() -> cb.onComplete(true, msg, resultFile));
+
+            } catch (Exception e) {
+                log.error("Backup failed: " + e.getMessage());
+                mainHandler.post(() -> cb.onComplete(false, e.getMessage(), null));
+            }
+        });
+    }
+
+    // ── RESTORE — from a backup_history entry (LOCAL file or CLOUD download) ──
+    public void restoreBackup(Context ctx, BackupEntry entry, BackupCallback cb) {
+        executor.execute(() -> {
+            log.info("Restoring backup #" + entry.id + " (" + entry.backupMode + ")");
+            try {
+                File zipFile;
+                if ("CLOUD".equals(entry.backupMode)) {
+                    if (entry.externalId == null || entry.externalId.isEmpty())
+                        throw new Exception("No cloud reference stored for this backup");
+                    WorkDriveApiService wds = new WorkDriveApiService(ctx);
+                    byte[] bytes = wds.downloadFile(entry.externalId);
+                    zipFile = new File(ctx.getCacheDir(), "restore_cloud_" + entry.id + ".zip");
+                    try (FileOutputStream fos = new FileOutputStream(zipFile)) {
+                        fos.write(bytes);
+                    }
+                } else {
+                    zipFile = new File(entry.filePath);
+                    if (!zipFile.exists())
+                        throw new Exception("Local backup file missing: " + entry.filePath);
+                }
+                doRestore(ctx, zipFile);
+                log.success("Restore complete: backup #" + entry.id);
+                mainHandler.post(() -> cb.onComplete(true, "Restore successful!", null));
+            } catch (Exception e) {
+                log.error("Restore failed: " + e.getMessage());
+                mainHandler.post(() -> cb.onComplete(false, e.getMessage(), null));
+            }
+        });
+    }
+
+    // ── RESTORE — from a manually picked ZIP file (↑ Restore ZIP button) ──────
+    public void restoreBackup(Context ctx, File zipFile, BackupCallback cb) {
+        executor.execute(() -> {
+            log.info("Restoring backup from picked file: " + zipFile.getName());
+            try {
+                doRestore(ctx, zipFile);
+                mainHandler.post(() -> cb.onComplete(true, "Restore successful!", null));
+            } catch (Exception e) {
+                log.error("Restore failed: " + e.getMessage());
+                mainHandler.post(() -> cb.onComplete(false, e.getMessage(), null));
+            }
+        });
+    }
+
+    private void doRestore(Context ctx, File zipFile) throws Exception {
+        SQLiteDatabase db = LocalDatabase.get(ctx).getWritableDatabase();
+        JSONObject backup = null;
+        Map<String, byte[]> receiptBytesByEntry = new HashMap<>();
+
+        try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipFile))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int len;
+                while ((len = zis.read(buf)) > 0) bos.write(buf, 0, len);
+
+                if (entry.getName().equals("backup_data.json")) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        backup = new JSONObject(bos.toString(StandardCharsets.UTF_8));
+                    }
+                } else if (entry.getName().startsWith("Receipts/")) {
+                    receiptBytesByEntry.put(entry.getName().substring("Receipts/".length()), bos.toByteArray());
+                }
+            }
+        }
+        if (backup == null) throw new Exception("Invalid backup ZIP — backup_data.json missing");
+
+        // FK checks OFF — must be set BEFORE beginTransaction(), SQLite doesn't
+        // allow toggling this pragma mid-transaction.
+        db.execSQL("PRAGMA foreign_keys = OFF");
+        db.beginTransaction();
+        try {
+            // Parents first, then children — but with FK off this order no longer
+            // strictly matters; keeping it logical anyway for clarity.
+            restoreTable(db, "cash_books", backup.optJSONArray("cash_books"));
+            restoreTable(db, "categories", backup.optJSONArray("categories"));
+            restoreTable(db, "sub_categories", backup.optJSONArray("sub_categories"));
+            restoreTable(db, "column_definitions", backup.optJSONArray("column_definitions"));
+            restoreTable(db, "transactions", backup.optJSONArray("transactions"));
+            restoreTable(db, "transaction_custom_values", backup.optJSONArray("transaction_custom_values"));
+            restoreTable(db, "transaction_receipts", backup.optJSONArray("transaction_receipts"));
+            restoreTable(db, "transaction_audit_log", backup.optJSONArray("transaction_audit_log"));
+            restoreTable(db, "budgets", backup.optJSONArray("budgets"));
+            restoreTable(db, "budget_categories", backup.optJSONArray("budget_categories"));
+            restoreTable(db, "schedulers", backup.optJSONArray("schedulers"));
+            restoreTable(db, "scheduler_log", backup.optJSONArray("scheduler_log"));
+            restoreTable(db, "deleted_records", backup.optJSONArray("deleted_records"));
+            restoreTable(db, "payment_types", backup.optJSONArray("payment_types"));
+            restoreTable(db, "keyword_mappings", backup.optJSONArray("keyword_mappings"));
+            restoreTable(db, "events", backup.optJSONArray("events"));
+            restoreTable(db, "reminders", backup.optJSONArray("reminders"));
+            restoreTable(db, "event_reminders", backup.optJSONArray("event_reminders"));
+            restoreTable(db, "tasks", backup.optJSONArray("tasks"));
+            restoreTable(db, "task_events", backup.optJSONArray("task_events"));
+            restoreTable(db, "task_alarms", backup.optJSONArray("task_alarms"));
+
+            restoreTable(db, "passbook_entries", backup.optJSONArray("passbook_entries"));
+            restoreTable(db, "budget_allocation_template", backup.optJSONArray("budget_allocation_template"));
+            restoreTable(db, "recycle_bin", backup.optJSONArray("recycle_bin"));
+            restoreTable(db, "app_config", backup.optJSONArray("app_config"));
+            restoreTable(db, "ai_chat_messages", backup.optJSONArray("ai_chat_messages"));
+            restoreTable(db, "settlement_links", backup.optJSONArray("settlement_links"));
+            String restoredSalt = backup.optString("cloud_salt", "");
+            if (!restoredSalt.isEmpty() && com.expenseos.sync.CloudLock.getSalt(ctx) == null)
+                com.expenseos.sync.CloudLock.setSalt(ctx, restoredSalt);
+            restoreTable(db, "import_log", backup.optJSONArray("import_log"));
+            restoreTable(db, "card_mappings", backup.optJSONArray("card_mappings"));
+
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+            db.execSQL("PRAGMA foreign_keys = ON");   // restore FK enforcement for normal app use
+            com.expenseos.db.LocalDB.getInstance(ctx).resyncSequences(
+                    "cash_books", "categories", "sub_categories", "column_definitions",
+                    "transactions", "transaction_custom_values", "deleted_records",
+                    "transaction_audit_log", "transaction_receipts", "schedulers",
+                    "scheduler_log", "budgets", "budget_categories", "payment_types",
+                    "keyword_mappings", "events", "reminders", "event_reminders", "tasks",
+                    "task_events", "task_alarms", "recycle_bin", "budget_allocation_template",
+                    "settlement_links", "ai_chat_messages"
+            );
+        }
+
+        // second pass — fill in receipt BLOBs from the zip's Receipts/ entries
+        for (Map.Entry<String, byte[]> e : receiptBytesByEntry.entrySet()) {
+            String entryName = e.getKey(); // "{id}_{file_name}"
+            int us = entryName.indexOf('_');
+            if (us <= 0) continue;
+            try {
+                int receiptId = Integer.parseInt(entryName.substring(0, us));
+                byte[] data;
+                try {
+                    // Entries from new backups are ciphertext; entries from older backups are plaintext and pass through unchanged
+                    data = FileCrypto.decrypt(ctx, e.getValue(), "Receipts/" + entryName);
+                } catch (IOException ex) {
+                    log.error("Attachment " + receiptId + " not restored: " + ex.getMessage());
+                    continue;
+                }
+                ContentValues cv = new ContentValues();
+                cv.put("file_data", data);
+                db.update("transaction_receipts", cv, "id=?", new String[]{String.valueOf(receiptId)});
+            } catch (NumberFormatException ignored) {
+            }
+        }
+    }
+
+    // ── LIST LOCAL BACKUP HISTORY (both LOCAL + CLOUD entries recorded here) ──
+    public List<BackupEntry> listBackups(Context ctx) {
+        List<BackupEntry> list = new ArrayList<>();
+        Cursor c = LocalDatabase.get(ctx).getReadableDatabase()
+                .rawQuery("SELECT * FROM backup_history ORDER BY id DESC", null);
+        while (c.moveToNext()) {
+            BackupEntry e = new BackupEntry();
+            e.id = c.getInt(c.getColumnIndexOrThrow("id"));
+            e.fileName = c.getString(c.getColumnIndexOrThrow("file_name"));
+            e.filePath = c.getString(c.getColumnIndexOrThrow("file_path"));
+            e.fileSizeBytes = c.getLong(c.getColumnIndexOrThrow("file_size_bytes"));
+            e.backupType = c.getString(c.getColumnIndexOrThrow("backup_type"));
+            e.backupMode = c.getString(c.getColumnIndexOrThrow("backup_mode"));
+            e.status = c.getString(c.getColumnIndexOrThrow("status"));
+            e.description = c.getString(c.getColumnIndexOrThrow("description"));
+            e.incomeCount = c.getInt(c.getColumnIndexOrThrow("income_count"));
+            e.expenseCount = c.getInt(c.getColumnIndexOrThrow("expense_count"));
+            e.createdAt = c.getString(c.getColumnIndexOrThrow("created_at"));
+            int extIdx = c.getColumnIndexOrThrow("external_id");
+            e.externalId = c.isNull(extIdx) ? null : c.getString(extIdx);
+            list.add(e);
+        }
+        c.close();
+        return list;
+    }
+
+    public static class BackupEntry {
+        public int id;
+        public String fileName, filePath, backupType, backupMode, status, description, createdAt, externalId;
+        public long fileSizeBytes;
+        public int incomeCount, expenseCount;
+
+        public String getSizeFormatted() {
+            if (fileSizeBytes < 1024) return fileSizeBytes + " B";
+            return (fileSizeBytes / 1024) + " KB";
+        }
+    }
+
+    // ── Cursor Window Size Fix Helper ─────────────────────────────────────────
+    private void fixCursorWindowSize(Cursor cursor) {
+        if (cursor instanceof android.database.AbstractWindowedCursor) {
+            try {
+                // Set window size to 20 MB to handle huge BLOBs/Rows in recycle_bin & other tables
+                android.database.CursorWindow window = null;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    window = new CursorWindow("LargeWindow", 20 * 1024 * 1024);
+                }
+                ((android.database.AbstractWindowedCursor) cursor).setWindow(window);
+            } catch (Exception e) {
+                // Fallback using Reflection if setWindow fails on older Android versions
+                try {
+                    java.lang.reflect.Field field = android.database.CursorWindow.class.getDeclaredField("sCursorWindowSize");
+                    field.setAccessible(true);
+                    field.set(null, 20 * 1024 * 1024);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    private JSONArray tableToJson(SQLiteDatabase db, String table) throws Exception {
+        JSONArray arr = new JSONArray();
+        try (Cursor c = db.rawQuery("SELECT * FROM " + table, null)) {
+            fixCursorWindowSize(c); // 👈 CURSOR WINDOW SIZE FIX ADDED HERE
+            String[] cols = c.getColumnNames();
+            while (c.moveToNext()) {
+                JSONObject row = new JSONObject();
+                for (String col : cols) {
+                    int idx = c.getColumnIndex(col);
+                    switch (c.getType(idx)) {
+                        case Cursor.FIELD_TYPE_INTEGER -> row.put(col, c.getLong(idx));
+                        case Cursor.FIELD_TYPE_FLOAT -> row.put(col, c.getDouble(idx));
+                        case Cursor.FIELD_TYPE_NULL -> row.put(col, JSONObject.NULL);
+                        case Cursor.FIELD_TYPE_BLOB -> {
+                            // BLOB data (Base64) - Recycle bin or image byte array safety
+                            byte[] blob = c.getBlob(idx);
+                            if (blob != null) {
+                                row.put(col, android.util.Base64.encodeToString(blob, android.util.Base64.NO_WRAP));
+                                row.put(col + "_is_blob", true); // Flag to identify BLOB during restore
+                            } else {
+                                row.put(col, JSONObject.NULL);
+                            }
+                        }
+                        default -> row.put(col, c.getString(idx));
+                    }
+                }
+                arr.put(row);
+            }
+        }
+        return arr;
+    }
+
+    /**
+     * Same as transaction_receipts row but WITHOUT the file_data BLOB (kept as separate zip entries).
+     */
+    private JSONArray receiptsMetaToJson(SQLiteDatabase db) throws Exception {
+        JSONArray arr = new JSONArray();
+        try (Cursor c = db.rawQuery(
+                "SELECT id, transaction_id, file_name, file_type, file_size, uploaded_at, storage_path FROM transaction_receipts", null)) {
+            while (c.moveToNext()) {
+                JSONObject row = new JSONObject();
+                row.put("id", c.getInt(0));
+                row.put("transaction_id", c.getInt(1));
+                row.put("file_name", c.getString(2));
+                row.put("file_type", c.isNull(3) ? JSONObject.NULL : c.getString(3));
+                row.put("file_size", c.isNull(4) ? JSONObject.NULL : c.getLong(4));
+                row.put("uploaded_at", c.isNull(5) ? JSONObject.NULL : c.getString(5));
+                row.put("storage_path", c.isNull(6) ? JSONObject.NULL : c.getString(6));
+                arr.put(row);
+            }
+        }
+        return arr;
+    }
+
+    private void writeReceiptsToZip(Context ctx, SQLiteDatabase db, ZipOutputStream zos) throws Exception {
+        // Attachments that were moved to Supabase Storage are not part of the backup (metadata + storage_path only).
+        // Only legacy rows that still have a local blob are written, and always as ciphertext.
+        try (Cursor c = db.rawQuery(
+                "SELECT id, file_name, file_data FROM transaction_receipts "
+                        + "WHERE storage_path IS NULL AND file_data IS NOT NULL", null)) {
+
+            // 👈 CURSOR WINDOW SIZE FIX ADDED HERE
+            fixCursorWindowSize(c);
+
+            while (c.moveToNext()) {
+                int id = c.getInt(0);
+                String fname = c.getString(1);
+                byte[] data = c.getBlob(2);
+                if (data == null || data.length == 0) continue;
+                if (!FileCrypto.isReady(ctx)) {
+                    log.error("Attachment " + id + " skipped in backup: cloud passphrase is not set "
+                            + "(plaintext is never written to a backup)");
+                    continue;
+                }
+                String entryName = "Receipts/" + id + "_" + fname;
+                zos.putNextEntry(new ZipEntry(entryName));
+                zos.write(FileCrypto.encrypt(ctx, data, entryName));
+                zos.closeEntry();
+            }
+        }
+    }
+
+    private void restoreTable(SQLiteDatabase db, String table, JSONArray arr) throws Exception {
+        if (arr == null) return;
+        // Columns that exist right now. Backups made before a column was dropped (e.g. icon/color) still contain it.
+        java.util.Set<String> validCols = new java.util.HashSet<>();
+        try (android.database.Cursor pc = db.rawQuery("PRAGMA table_info(" + table + ")", null)) {
+            while (pc.moveToNext()) validCols.add(pc.getString(1));
+        }
+        db.delete(table, null, null);
+        for (int i = 0; i < arr.length(); i++) {
+            JSONObject row = arr.getJSONObject(i);
+            ContentValues cv = new ContentValues();
+            JSONArray names = row.names();
+            if (names != null) {
+                for (int j = 0; j < names.length(); j++) {
+                    String key = names.getString(j);
+                    if (key.endsWith("_is_blob")) continue; // Skip helper key
+                    if (!validCols.isEmpty() && !validCols.contains(key))
+                        continue; // column no longer exists
+
+                    Object val = row.get(key);
+                    if (val == JSONObject.NULL) {
+                        cv.putNull(key);
+                    } else if (row.optBoolean(key + "_is_blob", false)) {
+                        // Decode Base64 string back to byte[] for BLOB columns
+                        byte[] blob = android.util.Base64.decode(val.toString(), android.util.Base64.NO_WRAP);
+                        cv.put(key, blob);
+                    } else if (val instanceof Integer) {
+                        cv.put(key, (Integer) val);
+                    } else if (val instanceof Long) {
+                        cv.put(key, (Long) val);
+                    } else if (val instanceof Double) {
+                        cv.put(key, (Double) val);
+                    } else {
+                        cv.put(key, val.toString());
+                    }
+                }
+            }
+            db.insertWithOnConflict(table, null, cv, SQLiteDatabase.CONFLICT_REPLACE);
+        }
+    }
+
+    private void copyFile(File src, File dst) throws IOException {
+        try (FileInputStream in = new FileInputStream(src); FileOutputStream out = new FileOutputStream(dst)) {
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
+        }
+    }
+
+    private File getBackupDir(Context ctx) {
+        File dir = new File(Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOCUMENTS), "ExpenseOS/Backups");
+        if (!dir.exists()) dir.mkdirs();
+        return dir;
+    }
+
+    private void logBackupHistory(Context ctx, String fileName, String path, long size,
+                                  String type, String mode, String status, String desc,
+                                  int income, int expense, String externalId) {
+        ContentValues cv = new ContentValues();
+        cv.put("file_name", fileName);
+        cv.put("file_path", path);
+        cv.put("file_size_bytes", size);
+        cv.put("backup_type", type);
+        cv.put("backup_mode", mode);
+        cv.put("status", status);
+        cv.put("description", desc != null ? desc : "");
+        cv.put("income_count", income);
+        cv.put("expense_count", expense);
+        if (externalId != null) cv.put("external_id", externalId);
+        cv.put("created_at", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(new Date()));
+        LocalDatabase.get(ctx).getWritableDatabase().insert("backup_history", null, cv);
+    }
+
+    private int countRows(SQLiteDatabase db, String table, String where) {
+        Cursor c = db.rawQuery("SELECT COUNT(*) FROM " + table + " WHERE " + where, null);
+        int count = 0;
+        if (c.moveToFirst()) count = c.getInt(0);
+        c.close();
+        return count;
+    }
+
+    public void deleteBackup(Context ctx, BackupEntry entry, BackupCallback cb) {
+        executor.execute(() -> {
+            try {
+                if ("CLOUD".equals(entry.backupMode) && entry.externalId != null && !entry.externalId.isEmpty()) {
+                    new WorkDriveApiService(ctx).deleteFile(entry.externalId);
+                } else if (entry.filePath != null && !entry.filePath.isEmpty()) {
+                    new File(entry.filePath).delete();
+                }
+                LocalDatabase.get(ctx).getWritableDatabase()
+                        .delete("backup_history", "id=?", new String[]{String.valueOf(entry.id)});
+                mainHandler.post(() -> cb.onComplete(true, "Backup deleted", null));
+            } catch (Exception e) {
+                mainHandler.post(() -> cb.onComplete(false, e.getMessage(), null));
+            }
+        });
+    }
+
+    public void createBackupScheduled(Context ctx) {
+        createBackup(ctx, "Scheduled daily backup", BackupMode.CLOUD, (ok, msg, file) -> { /* silent, no UI */ });
+    }
+
+    public void downloadForShare(Context ctx, BackupEntry entry, BackupCallback cb) {
+        executor.execute(() -> {
+            try {
+                File file;
+                if ("CLOUD".equals(entry.backupMode)) {
+                    if (entry.externalId == null || entry.externalId.isEmpty())
+                        throw new Exception("No cloud reference for this backup");
+                    byte[] bytes = new WorkDriveApiService(ctx).downloadFile(entry.externalId);
+                    file = new File(ctx.getCacheDir(), entry.fileName);
+                    try (FileOutputStream fos = new FileOutputStream(file)) {
+                        fos.write(bytes);
+                    }
+                } else {
+                    file = new File(entry.filePath);
+                    if (!file.exists())
+                        throw new Exception("Local file missing: " + entry.filePath);
+                }
+                mainHandler.post(() -> cb.onComplete(true, "Ready", file));
+            } catch (Exception e) {
+                mainHandler.post(() -> cb.onComplete(false, e.getMessage(), null));
+            }
+        });
+    }
+
+    /**
+     * Mirrors web FilesApiService.UploadFile()'s auto-prune: keep only the newest MAX_CLOUD_BACKUPS files on WorkDrive.
+     */
+    private void pruneOldCloudBackups(Context ctx, WorkDriveApiService wds) {
+        try {
+            List<WorkDriveApiService.WorkDriveFileInfo> files = new java.util.ArrayList<>();
+            for (WorkDriveApiService.WorkDriveFileInfo f : wds.listFiles())
+                if (f.name != null && f.name.startsWith("backup_"))
+                    files.add(f);   // ignore ExpenseOS_Bulk_Import.xlsx etc.
+            if (files.size() <= MAX_CLOUD_BACKUPS) return;
+
+            files.sort((a, b) -> Long.compare(a.modifiedTimeMillis, b.modifiedTimeMillis)); // oldest first
+            int toDelete = files.size() - MAX_CLOUD_BACKUPS;
+
+            int deleted = 0;
+            for (int i = 0; i < toDelete; i++) {
+                try {
+                    if (wds.deleteFile(files.get(i).id)) {
+                        deleted++;
+                    } else {
+                        log.warn("Delete returned false for: " + files.get(i).name + " (id=" + files.get(i).id + ")");
+                    }
+                } catch (Exception e) {
+                    log.error("Delete failed for " + files.get(i).name + ": " + e.getMessage());   // <-- was silently ignored
+                }
+            }
+            log.info("Cloud backup prune: " + toDelete + " over limit, " + deleted + " deleted, "
+                    + (toDelete - deleted) + " failed");
+
+            // Keep local backup_history in sync — drop rows whose external_id no longer exists
+            java.util.Set<String> remainingIds = new java.util.HashSet<>();
+            for (WorkDriveApiService.WorkDriveFileInfo f : files.subList(toDelete, files.size()))
+                remainingIds.add(f.id);
+            for (int i = 0; i < toDelete; i++) {
+                LocalDatabase.get(ctx).getWritableDatabase()
+                        .delete("backup_history", "backup_mode='CLOUD' AND external_id=?",
+                                new String[]{files.get(i).id});
+            }
+        } catch (Exception e) {
+            log.warn("Cloud backup prune skipped: " + e.getMessage());
+        }
+    }
+}

@@ -1,0 +1,630 @@
+package com.expenseos.util;
+
+// imports — OLD
+
+import com.expenseos.model.Transaction;
+import com.itextpdf.text.BaseColor;
+import com.itextpdf.text.Document;
+import com.itextpdf.text.Element;
+import com.itextpdf.text.Font;
+import com.itextpdf.text.PageSize;
+import com.itextpdf.text.Paragraph;
+import com.itextpdf.text.pdf.BaseFont;
+import com.itextpdf.text.pdf.PdfContentByte;
+import com.itextpdf.text.pdf.PdfPCell;
+import com.itextpdf.text.pdf.PdfPTable;
+import com.itextpdf.text.pdf.PdfPageEventHelper;
+import com.itextpdf.text.pdf.PdfTemplate;
+import com.itextpdf.text.pdf.PdfWriter;
+
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.CellStyle;
+import org.apache.poi.ss.usermodel.FillPatternType;
+import org.apache.poi.ss.usermodel.IndexedColors;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public class ReportGenerator {
+
+    public static final String TYPE_ALL = "all";
+    public static final String TYPE_DAYWISE = "daywise";
+    public static final String TYPE_CATEGORYWISE = "categorywise";
+    public static final String TYPE_SUBCATEGORYWISE = "subcategorywise";
+    public static final String TYPE_PAYMENTTYPEWISE = "paymenttypewise";
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd MMM yyyy");
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("hh:mm a");
+
+    // ── CSV ──────────────────────────────────────────────────
+    public static void writeCsv(List<Transaction> txns, String reportType, OutputStream out) throws Exception {
+        Writer w = new OutputStreamWriter(out);
+        switch (reportType) {
+            case TYPE_DAYWISE -> writeDaywiseCsv(txns, w);
+            case TYPE_CATEGORYWISE -> writeCategorywiseCsv(txns, w);
+            case TYPE_SUBCATEGORYWISE -> writeSubcategorywiseCsv(txns, w);
+            case TYPE_PAYMENTTYPEWISE -> writePaymentTypewiseCsv(txns, w); // 👈 Added
+            default -> writeAllEntriesCsv(txns, w);
+        }
+        w.flush();
+    }
+
+    // writeCsv() method-க்கு கீழே (before "── PDF (iText 5)" section) இதை முழுசா சேருங்க
+    // ── Excel (.xlsx via Apache POI) ─────────────────────────
+    public static void writeXlsx(List<Transaction> txns, String reportType, OutputStream out) throws Exception {
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            Sheet sheet = wb.createSheet("Report");
+            CellStyle headerStyle = wb.createCellStyle();
+            headerStyle.setFillForegroundColor(IndexedColors.BLUE.getIndex());
+            headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+            org.apache.poi.ss.usermodel.Font headerFont = wb.createFont();
+            headerFont.setBold(true);
+            headerFont.setColor(IndexedColors.WHITE.getIndex());
+            headerStyle.setFont(headerFont);
+
+            switch (reportType) {
+                case TYPE_DAYWISE -> writeDaywiseXlsx(txns, sheet, headerStyle);
+                case TYPE_CATEGORYWISE -> writeCategorywiseXlsx(txns, sheet, headerStyle);
+                case TYPE_SUBCATEGORYWISE -> writeSubcategorywiseXlsx(txns, sheet, headerStyle);
+                case TYPE_PAYMENTTYPEWISE -> writePaymentTypewiseXlsx(txns, sheet, headerStyle);
+                default -> writeAllEntriesXlsx(txns, sheet, headerStyle);
+            }
+            // autoSizeColumn() needs java.awt.font.FontRenderContext for text
+            // measurement — AWT isn't available on Android, so it crashes
+            // with NoClassDefFoundError. Set reasonable fixed widths instead
+            // (POI widths are in 1/256 of a character width). 8 columns
+            // covers the widest report type (All Entries); narrower report
+            // types simply leave the extra columns unused.
+            int[] colWidths = {14, 10, 8, 20, 20, 14, 12, 28}; // Date,Time,Type,Category,SubCat,PaymentType,Amount,Note
+            for (int i = 0; i < colWidths.length; i++) {
+                sheet.setColumnWidth(i, colWidths[i] * 256);
+            }
+            wb.write(out);
+        }
+    }
+
+    private static void writeAllEntriesXlsx(List<Transaction> txns, Sheet sheet, CellStyle headerStyle) {
+        Row header = sheet.createRow(0);
+        String[] cols = {"Date", "Time", "Type", "Category", "Sub Category", "Payment Type", "Amount", "Note"};
+        for (int i = 0; i < cols.length; i++) setHeader(header, i, cols[i], headerStyle);
+        int r = 1;
+        for (Transaction t : txns) {
+            Row row = sheet.createRow(r++);
+            row.createCell(0).setCellValue(t.getDateTime() != null ? t.getDateTime().format(DATE_FMT) : "");
+            row.createCell(1).setCellValue(t.getDateTime() != null ? t.getDateTime().format(TIME_FMT) : "");
+            row.createCell(2).setCellValue(t.getType().name());
+            row.createCell(3).setCellValue(t.getCategoryName() != null ? t.getCategoryName() : "");
+            row.createCell(4).setCellValue(t.getSubCategoryName() != null ? t.getSubCategoryName() : "");
+            row.createCell(5).setCellValue(t.getPaymentTypeName() != null ? t.getPaymentTypeName() : "");
+            row.createCell(6).setCellValue(t.getAmount() != null ? t.getAmount().doubleValue() : 0);
+            row.createCell(7).setCellValue(t.getNote() != null ? t.getNote() : "");
+        }
+    }
+
+    private static void writeDaywiseXlsx(List<Transaction> txns, Sheet sheet, CellStyle headerStyle) {
+        Row header = sheet.createRow(0);
+        String[] cols = {"Date", "Total In", "Total Out", "Balance"};
+        for (int i = 0; i < cols.length; i++) setHeader(header, i, cols[i], headerStyle);
+        int r = 1;
+        BigDecimal running = BigDecimal.ZERO;
+        for (Map.Entry<String, BigDecimal[]> e : dayTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            running = running.add(in).subtract(out);
+            Row row = sheet.createRow(r++);
+            row.createCell(0).setCellValue(e.getKey());
+            row.createCell(1).setCellValue(in.doubleValue());
+            row.createCell(2).setCellValue(out.doubleValue());
+            row.createCell(3).setCellValue(running.doubleValue());
+        }
+    }
+
+    private static void writeCategorywiseXlsx(List<Transaction> txns, Sheet sheet, CellStyle headerStyle) {
+        Row header = sheet.createRow(0);
+        String[] cols = {"Category", "Income", "Expense", "Net"};
+        for (int i = 0; i < cols.length; i++) setHeader(header, i, cols[i], headerStyle);
+        int r = 1;
+        for (Map.Entry<String, BigDecimal[]> e : categoryTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            Row row = sheet.createRow(r++);
+            row.createCell(0).setCellValue(e.getKey());
+            row.createCell(1).setCellValue(in.doubleValue());
+            row.createCell(2).setCellValue(out.doubleValue());
+            row.createCell(3).setCellValue(in.subtract(out).doubleValue());
+        }
+    }
+
+    private static void writeSubcategorywiseXlsx(List<Transaction> txns, Sheet sheet, CellStyle headerStyle) {
+        Row header = sheet.createRow(0);
+        String[] cols = {"Sub Category", "Income", "Expense", "Net"};
+        for (int i = 0; i < cols.length; i++) setHeader(header, i, cols[i], headerStyle);
+        int r = 1;
+        for (Map.Entry<String, BigDecimal[]> e : subCategoryTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            Row row = sheet.createRow(r++);
+            row.createCell(0).setCellValue(e.getKey());
+            row.createCell(1).setCellValue(in.doubleValue());
+            row.createCell(2).setCellValue(out.doubleValue());
+            row.createCell(3).setCellValue(in.subtract(out).doubleValue());
+        }
+    }
+
+    private static void writePaymentTypewiseXlsx(List<Transaction> txns, Sheet sheet, CellStyle headerStyle) {
+        Row header = sheet.createRow(0);
+        String[] cols = {"Payment Type", "Income", "Expense", "Net"};
+        for (int i = 0; i < cols.length; i++) setHeader(header, i, cols[i], headerStyle);
+        int r = 1;
+        for (Map.Entry<String, BigDecimal[]> e : paymentTypeTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            Row row = sheet.createRow(r++);
+            row.createCell(0).setCellValue(e.getKey());
+            row.createCell(1).setCellValue(in.doubleValue());
+            row.createCell(2).setCellValue(out.doubleValue());
+            row.createCell(3).setCellValue(in.subtract(out).doubleValue());
+        }
+    }
+
+    private static void setHeader(Row row, int col, String text, CellStyle style) {
+        Cell cell = row.createCell(col);
+        cell.setCellValue(text);
+        cell.setCellStyle(style);
+    }
+
+    private static void writeAllEntriesCsv(List<Transaction> txns, Writer w) throws Exception {
+        w.write("Date,Time,Type,Category,Sub Category,Payment Type,Amount,Note\n");
+        for (Transaction t : txns) {
+            w.write(csvEscape(t.getDateTime() != null ? t.getDateTime().format(DATE_FMT) : "") + ",");
+            w.write(csvEscape(t.getDateTime() != null ? t.getDateTime().format(TIME_FMT) : "") + ",");
+            w.write(csvEscape(t.getType().name()) + ",");
+            w.write(csvEscape(t.getCategoryName()) + ",");
+            w.write(csvEscape(t.getSubCategoryName()) + ",");
+            w.write(csvEscape(t.getPaymentTypeName()) + ",");
+            w.write(csvEscape(t.getAmount() != null ? t.getAmount().toPlainString() : "0") + ",");
+            w.write(csvEscape(t.getNote()) + "\n");
+        }
+    }
+
+    private static void writeDaywiseCsv(List<Transaction> txns, Writer w) throws Exception {
+        w.write("Date,Total In,Total Out,Balance\n");
+        BigDecimal running = BigDecimal.ZERO;
+        for (Map.Entry<String, BigDecimal[]> e : dayTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            running = running.add(in).subtract(out);
+            w.write(csvEscape(e.getKey()) + "," + in.toPlainString() + "," + out.toPlainString() + "," + running.toPlainString() + "\n");
+        }
+    }
+
+    private static void writeCategorywiseCsv(List<Transaction> txns, Writer w) throws Exception {
+        w.write("Category,Total Income,Total Expense,Net\n");
+        for (Map.Entry<String, BigDecimal[]> e : categoryTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            w.write(csvEscape(e.getKey()) + "," + in.toPlainString() + "," + out.toPlainString() + "," + in.subtract(out).toPlainString() + "\n");
+        }
+    }
+
+    private static void writeSubcategorywiseCsv(List<Transaction> txns, Writer w) throws Exception {
+        w.write("Sub Category,Total Income,Total Expense,Net\n");
+        for (Map.Entry<String, BigDecimal[]> e : subCategoryTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            w.write(csvEscape(e.getKey()) + "," + in.toPlainString() + "," + out.toPlainString() + "," + in.subtract(out).toPlainString() + "\n");
+        }
+    }
+
+    // 👈 Payment Type-wise CSV logic added
+    private static void writePaymentTypewiseCsv(List<Transaction> txns, Writer w) throws Exception {
+        w.write("Payment Type,Total Income,Total Expense,Net\n");
+        for (Map.Entry<String, BigDecimal[]> e : paymentTypeTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            w.write(csvEscape(e.getKey()) + "," + in.toPlainString() + "," + out.toPlainString() + "," + in.subtract(out).toPlainString() + "\n");
+        }
+    }
+
+    private static String csvEscape(String s) {
+        if (s == null) return "";
+        if (s.contains(",") || s.contains("\"") || s.contains("\n"))
+            return "\"" + s.replace("\"", "\"\"") + "\"";
+        return s;
+    }
+
+    // ── PDF (iText 5) ────────────────────────────────────────
+    // Backward-compat overload — no cashbook name / custom title.
+    public static void writePdf(List<Transaction> txns, String reportType, OutputStream out) throws Exception {
+        writePdf(txns, reportType, null, null, out);
+    }
+
+    /**
+     * @param cashbookName printed under the title as "Cashbook: <name>" —
+     *                     pass null/blank to omit.
+     * @param customTitle  overrides the default report title (e.g. "August
+     *                     2026 Expense Report") — pass null/blank to use the
+     *                     default title for the report type.
+     */
+    public static void writePdf(List<Transaction> txns, String reportType, String cashbookName,
+                                String customTitle, OutputStream out) throws Exception {
+        Document doc = new Document(PageSize.A4, 24, 24, 32, 40); // extra bottom margin for the footer
+        PdfWriter writer = PdfWriter.getInstance(doc, out);
+        writer.setPageEvent(new FooterEvent());
+        doc.open();
+
+        Font titleFont = new Font(Font.FontFamily.HELVETICA, 16, Font.BOLD);
+        Font metaFont = new Font(Font.FontFamily.HELVETICA, 9, Font.NORMAL, BaseColor.GRAY);
+        Font headFont = new Font(Font.FontFamily.HELVETICA, 10, Font.BOLD, BaseColor.WHITE);
+        Font cellFont = new Font(Font.FontFamily.HELVETICA, 9, Font.NORMAL);
+
+        String titleText = (customTitle != null && !customTitle.trim().isEmpty())
+                ? customTitle.trim() : reportTitle(reportType);
+        Paragraph title = new Paragraph(titleText, titleFont);
+        title.setAlignment(Element.ALIGN_CENTER);
+        title.setSpacingAfter(4);
+        doc.add(title);
+
+        if (cashbookName != null && !cashbookName.trim().isEmpty()) {
+            Paragraph cb = new Paragraph("Cashbook: " + cashbookName.trim(), metaFont);
+            cb.setAlignment(Element.ALIGN_CENTER);
+            cb.setSpacingAfter(2);
+            doc.add(cb);
+        }
+
+        String generatedAt = LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd MMM yyyy, hh:mm a"));
+        Paragraph gen = new Paragraph("Generated: " + generatedAt, metaFont);
+        gen.setAlignment(Element.ALIGN_CENTER);
+        gen.setSpacingAfter(16);
+        doc.add(gen);
+
+        switch (reportType) {
+            case TYPE_DAYWISE -> addDaywiseTable(doc, txns, headFont, cellFont);
+            case TYPE_CATEGORYWISE -> addCategorywiseTable(doc, txns, headFont, cellFont);
+            case TYPE_SUBCATEGORYWISE -> addSubcategorywiseTable(doc, txns, headFont, cellFont);
+            case TYPE_PAYMENTTYPEWISE ->
+                    addPaymentTypewiseTable(doc, txns, headFont, cellFont); // 👈 Added
+            default -> addAllEntriesTable(doc, txns, headFont, cellFont);
+        }
+
+        doc.close();
+    }
+
+    // Draws "Page X of Y" (bottom-right) and "Powered by ExpenseOS"
+    // (bottom-center) on every page. The "of Y" part needs the total page
+    // count, which iText only knows once the whole document is closed — so
+    // a blank PdfTemplate placeholder is reserved on each page and filled
+    // in with the real total at onCloseDocument(), the standard iText 5
+    // trick for this.
+    private static class FooterEvent extends PdfPageEventHelper {
+        private PdfTemplate totalPagesTemplate;
+        private BaseFont baseFont;
+        private static final float FONT_SIZE = 8f;
+
+        @Override
+        public void onOpenDocument(PdfWriter writer, Document document) {
+            try {
+                baseFont = BaseFont.createFont(BaseFont.HELVETICA, BaseFont.CP1252, BaseFont.NOT_EMBEDDED);
+            } catch (Exception ignored) {
+            }
+            totalPagesTemplate = writer.getDirectContent().createTemplate(30, 16);
+        }
+
+        @Override
+        public void onEndPage(PdfWriter writer, Document document) {
+            if (baseFont == null) return;
+            PdfContentByte cb = writer.getDirectContent();
+            float y = document.bottom() - 20;
+            cb.saveState();
+            cb.setColorFill(BaseColor.GRAY);
+
+            // "Page X of " + [template with total], right-aligned
+            String pageLabel = "Page " + writer.getPageNumber() + " of ";
+            float pageLabelWidth = baseFont.getWidthPoint(pageLabel, FONT_SIZE);
+            cb.beginText();
+            cb.setFontAndSize(baseFont, FONT_SIZE);
+            cb.setTextMatrix(document.right() - pageLabelWidth - 30, y);
+            cb.showText(pageLabel);
+            cb.endText();
+            cb.addTemplate(totalPagesTemplate, document.right() - 30, y);
+
+            // "Powered by ExpenseOS", centered
+            String powered = "Powered by ExpenseOS";
+            float poweredWidth = baseFont.getWidthPoint(powered, FONT_SIZE);
+            cb.beginText();
+            cb.setFontAndSize(baseFont, FONT_SIZE);
+            cb.setTextMatrix((document.left() + document.right() - poweredWidth) / 2, y);
+            cb.showText(powered);
+            cb.endText();
+
+            cb.restoreState();
+        }
+
+        @Override
+        public void onCloseDocument(PdfWriter writer, Document document) {
+            if (baseFont == null) return;
+            totalPagesTemplate.beginText();
+            totalPagesTemplate.setFontAndSize(baseFont, FONT_SIZE);
+            totalPagesTemplate.setColorFill(BaseColor.GRAY);
+            totalPagesTemplate.setTextMatrix(0, 0);
+            totalPagesTemplate.showText(String.valueOf(writer.getPageNumber()));
+            totalPagesTemplate.endText();
+        }
+    }
+
+    private static String reportTitle(String type) {
+        return switch (type) {
+            case TYPE_DAYWISE -> "Day-wise Summary";
+            case TYPE_CATEGORYWISE -> "Category-wise Summary";
+            case TYPE_SUBCATEGORYWISE -> "Sub Category-wise Summary";
+            case TYPE_PAYMENTTYPEWISE -> "Payment Type-wise Summary"; // 👈 Added
+            default -> "All Entries Report";
+        };
+    }
+
+    private static void addAllEntriesTable(Document doc, List<Transaction> txns, Font headFont, Font cellFont) throws Exception {
+        PdfPTable table = new PdfPTable(new float[]{2f, 1.2f, 1.5f, 1.5f, 1.5f, 1.3f, 2f});
+        table.setWidthPercentage(100);
+        for (String h : new String[]{"Date", "Type", "Category", "Sub Cat", "Payment Type", "Amount", "Note"})
+            addHeaderCell(table, h, headFont);
+
+        for (Transaction t : txns) {
+            String date = (t.getDateTime() != null ? t.getDateTime().format(DATE_FMT) + " " + t.getDateTime().format(TIME_FMT) : "");
+            addCell(table, date, cellFont);
+            addCell(table, t.getType().name(), cellFont);
+            addCell(table, t.getCategoryName() != null ? t.getCategoryName() : "", cellFont);
+            addCell(table, t.getSubCategoryName() != null ? t.getSubCategoryName() : "", cellFont);
+            addCell(table, t.getPaymentTypeName() != null ? t.getPaymentTypeName() : "", cellFont);
+            addCell(table, t.getAmount() != null ? t.getAmount().toPlainString() : "0", cellFont);
+            addCell(table, t.getNote() != null ? t.getNote() : "", cellFont);
+        }
+
+        // ── Totals ──
+        BigDecimal totalIn = BigDecimal.ZERO, totalOut = BigDecimal.ZERO;
+        boolean hasIn = false, hasOut = false;
+        for (Transaction t : txns) {
+            BigDecimal amt = t.getAmount() != null ? t.getAmount() : BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) {
+                totalIn = totalIn.add(amt);
+                hasIn = true;
+            } else {
+                totalOut = totalOut.add(amt);
+                hasOut = true;
+            }
+        }
+
+        Font boldFont = new Font(cellFont);
+        boldFont.setStyle(Font.BOLD);
+        BaseColor totalBg = new BaseColor(226, 232, 240);
+
+        if (hasIn && hasOut) {
+            // Mixed selection → Income / Expense / Net
+            addTotalRow(table, "Total Income", totalIn, boldFont, totalBg);
+            addTotalRow(table, "Total Expense", totalOut, boldFont, totalBg);
+            addTotalRow(table, "Net", totalIn.subtract(totalOut), boldFont, totalBg);
+        } else {
+            // Only one type selected → single Total
+            addTotalRow(table, "Total", hasIn ? totalIn : totalOut, boldFont, totalBg);
+        }
+        doc.add(table);
+
+        addCategorySummaryTable(doc, txns, headFont, cellFont);
+    }
+
+
+    // Category-wise summary under the All Entries table: S.No / Category /
+    // Amount, highest amount first. Built only from the txns passed in, so
+    // for a multi-select export it covers just the selected entries.
+    private static void addCategorySummaryTable(Document doc, List<Transaction> txns, Font headFont, Font cellFont) throws Exception {
+        Map<String, BigDecimal> byCategory = new LinkedHashMap<>();
+        for (Transaction t : txns) {
+            String cat = (t.getCategoryName() != null && !t.getCategoryName().isEmpty())
+                    ? t.getCategoryName() : "Uncategorized";
+            BigDecimal amt = t.getAmount() != null ? t.getAmount() : BigDecimal.ZERO;
+            byCategory.merge(cat, amt, BigDecimal::add);
+        }
+        if (byCategory.isEmpty()) return;
+
+        List<Map.Entry<String, BigDecimal>> sorted = new ArrayList<>(byCategory.entrySet());
+        sorted.sort((a, b) -> b.getValue().compareTo(a.getValue())); // descending by amount
+
+        PdfPTable table = new PdfPTable(new float[]{1f, 4f, 2f});
+        table.setWidthPercentage(60);
+        table.setHorizontalAlignment(Element.ALIGN_LEFT);
+        table.setSpacingBefore(24f); // gap after the entries table
+        for (String h : new String[]{"S.No", "Category", "Amount"})
+            addHeaderCell(table, h, headFont);
+
+        int sno = 1;
+        BigDecimal grandTotal = BigDecimal.ZERO;
+        for (Map.Entry<String, BigDecimal> e : sorted) {
+            addCell(table, String.valueOf(sno++), cellFont);
+            addCell(table, e.getKey(), cellFont);
+            addCell(table, e.getValue().toPlainString(), cellFont);
+            grandTotal = grandTotal.add(e.getValue());
+        }
+
+        // Total row — label spans S.No + Category columns, value under Amount
+        Font boldFont = new Font(cellFont);
+        boldFont.setStyle(Font.BOLD);
+        BaseColor totalBg = new BaseColor(226, 232, 240);
+
+        PdfPCell label = new PdfPCell(new Paragraph("Total", boldFont));
+        label.setColspan(2);
+        label.setHorizontalAlignment(Element.ALIGN_RIGHT);
+        label.setPadding(5);
+        label.setBackgroundColor(totalBg);
+        table.addCell(label);
+
+        PdfPCell value = new PdfPCell(new Paragraph(grandTotal.toPlainString(), boldFont));
+        value.setPadding(5);
+        value.setBackgroundColor(totalBg);
+        table.addCell(value);
+
+        doc.add(table);
+    }
+
+    // Label spans the first 5 columns (right-aligned) so the value lines up
+    // under the "Amount" column; last cell is the empty "Note" column.
+    private static void addTotalRow(PdfPTable table, String label, BigDecimal amount, Font font, BaseColor bg) {
+        PdfPCell l = new PdfPCell(new Paragraph(label, font));
+        l.setColspan(5);
+        l.setHorizontalAlignment(Element.ALIGN_RIGHT);
+        l.setPadding(5);
+        l.setBackgroundColor(bg);
+        table.addCell(l);
+
+        PdfPCell a = new PdfPCell(new Paragraph(amount.toPlainString(), font));
+        a.setPadding(5);
+        a.setBackgroundColor(bg);
+        table.addCell(a);
+
+        PdfPCell n = new PdfPCell(new Paragraph("", font));
+        n.setBackgroundColor(bg);
+        table.addCell(n);
+    }
+
+    private static void addDaywiseTable(Document doc, List<Transaction> txns, Font headFont, Font cellFont) throws Exception {
+        PdfPTable table = new PdfPTable(new float[]{2f, 1.5f, 1.5f, 1.5f});
+        table.setWidthPercentage(100);
+        for (String h : new String[]{"Date", "Total In", "Total Out", "Balance"})
+            addHeaderCell(table, h, headFont);
+
+        BigDecimal running = BigDecimal.ZERO;
+        for (Map.Entry<String, BigDecimal[]> e : dayTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            running = running.add(in).subtract(out);
+            addCell(table, e.getKey(), cellFont);
+            addCell(table, in.toPlainString(), cellFont);
+            addCell(table, out.toPlainString(), cellFont);
+            addCell(table, running.toPlainString(), cellFont);
+        }
+        doc.add(table);
+    }
+
+    private static void addCategorywiseTable(Document doc, List<Transaction> txns, Font headFont, Font cellFont) throws Exception {
+        PdfPTable table = new PdfPTable(new float[]{2.2f, 1.5f, 1.5f, 1.5f});
+        table.setWidthPercentage(100);
+        for (String h : new String[]{"Category", "Income", "Expense", "Net"})
+            addHeaderCell(table, h, headFont);
+
+        for (Map.Entry<String, BigDecimal[]> e : categoryTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            addCell(table, e.getKey(), cellFont);
+            addCell(table, in.toPlainString(), cellFont);
+            addCell(table, out.toPlainString(), cellFont);
+            addCell(table, in.subtract(out).toPlainString(), cellFont);
+        }
+        doc.add(table);
+    }
+
+    private static void addSubcategorywiseTable(Document doc, List<Transaction> txns, Font headFont, Font cellFont) throws Exception {
+        PdfPTable table = new PdfPTable(new float[]{2.2f, 1.5f, 1.5f, 1.5f});
+        table.setWidthPercentage(100);
+        for (String h : new String[]{"Sub Category", "Income", "Expense", "Net"})
+            addHeaderCell(table, h, headFont);
+
+        for (Map.Entry<String, BigDecimal[]> e : subCategoryTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            addCell(table, e.getKey(), cellFont);
+            addCell(table, in.toPlainString(), cellFont);
+            addCell(table, out.toPlainString(), cellFont);
+            addCell(table, in.subtract(out).toPlainString(), cellFont);
+        }
+        doc.add(table);
+    }
+
+    // 👈 Payment Type-wise PDF Table logic added
+    private static void addPaymentTypewiseTable(Document doc, List<Transaction> txns, Font headFont, Font cellFont) throws Exception {
+        PdfPTable table = new PdfPTable(new float[]{2.2f, 1.5f, 1.5f, 1.5f});
+        table.setWidthPercentage(100);
+        for (String h : new String[]{"Payment Type", "Income", "Expense", "Net"})
+            addHeaderCell(table, h, headFont);
+
+        for (Map.Entry<String, BigDecimal[]> e : paymentTypeTotals(txns).entrySet()) {
+            BigDecimal in = e.getValue()[0], out = e.getValue()[1];
+            addCell(table, e.getKey(), cellFont);
+            addCell(table, in.toPlainString(), cellFont);
+            addCell(table, out.toPlainString(), cellFont);
+            addCell(table, in.subtract(out).toPlainString(), cellFont);
+        }
+        doc.add(table);
+    }
+
+    private static void addHeaderCell(PdfPTable table, String text, Font font) {
+        PdfPCell cell = new PdfPCell(new Paragraph(text, font));
+        cell.setBackgroundColor(new BaseColor(37, 99, 235));
+        cell.setPadding(6);
+        table.addCell(cell);
+    }
+
+    private static void addCell(PdfPTable table, String text, Font font) {
+        PdfPCell cell = new PdfPCell(new Paragraph(text, font));
+        cell.setPadding(5);
+        table.addCell(cell);
+    }
+
+    // ── Shared aggregation ─────────────────────────────────────
+    private static Map<String, BigDecimal[]> dayTotals(List<Transaction> txns) {
+        List<Transaction> sorted = new ArrayList<>(txns);
+        sorted.sort((a, b) -> {
+            if (a.getDateTime() == null || b.getDateTime() == null) return 0;
+            return a.getDateTime().compareTo(b.getDateTime());
+        });
+        Map<String, BigDecimal[]> map = new LinkedHashMap<>();
+        for (Transaction t : sorted) {
+            String day = t.getDateTime() != null ? t.getDateTime().format(DATE_FMT) : "Unknown";
+            map.putIfAbsent(day, new BigDecimal[]{BigDecimal.ZERO, BigDecimal.ZERO});
+            BigDecimal[] tot = map.get(day);
+            BigDecimal amt = t.getAmount() != null ? t.getAmount() : BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) tot[0] = tot[0].add(amt);
+            else tot[1] = tot[1].add(amt);
+        }
+        return map;
+    }
+
+    private static Map<String, BigDecimal[]> categoryTotals(List<Transaction> txns) {
+        Map<String, BigDecimal[]> map = new LinkedHashMap<>();
+        for (Transaction t : txns) {
+            String cat = t.getCategoryName() != null ? t.getCategoryName() : "Uncategorized";
+            map.putIfAbsent(cat, new BigDecimal[]{BigDecimal.ZERO, BigDecimal.ZERO});
+            BigDecimal[] tot = map.get(cat);
+            BigDecimal amt = t.getAmount() != null ? t.getAmount() : BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) tot[0] = tot[0].add(amt);
+            else tot[1] = tot[1].add(amt);
+        }
+        return map;
+    }
+
+    private static Map<String, BigDecimal[]> subCategoryTotals(List<Transaction> txns) {
+        Map<String, BigDecimal[]> map = new LinkedHashMap<>();
+        for (Transaction t : txns) {
+            String sub = t.getSubCategoryName() != null && !t.getSubCategoryName().isEmpty()
+                    ? t.getSubCategoryName() : "No Sub Category";
+            map.putIfAbsent(sub, new BigDecimal[]{BigDecimal.ZERO, BigDecimal.ZERO});
+            BigDecimal[] tot = map.get(sub);
+            BigDecimal amt = t.getAmount() != null ? t.getAmount() : BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) tot[0] = tot[0].add(amt);
+            else tot[1] = tot[1].add(amt);
+        }
+        return map;
+    }
+
+    // 👈 Payment Type calculation method added
+    private static Map<String, BigDecimal[]> paymentTypeTotals(List<Transaction> txns) {
+        Map<String, BigDecimal[]> map = new LinkedHashMap<>();
+        for (Transaction t : txns) {
+            String pt = t.getPaymentTypeName() != null && !t.getPaymentTypeName().isEmpty()
+                    ? t.getPaymentTypeName() : "Unspecified";
+            map.putIfAbsent(pt, new BigDecimal[]{BigDecimal.ZERO, BigDecimal.ZERO});
+            BigDecimal[] tot = map.get(pt);
+            BigDecimal amt = t.getAmount() != null ? t.getAmount() : BigDecimal.ZERO;
+            if (t.getType() == Transaction.Type.INCOME) tot[0] = tot[0].add(amt);
+            else tot[1] = tot[1].add(amt);
+        }
+        return map;
+    }
+}

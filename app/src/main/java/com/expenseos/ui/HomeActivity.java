@@ -1,0 +1,379 @@
+package com.expenseos.ui;
+
+import android.content.Intent;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.widget.ImageButton;
+import android.widget.TextView;
+
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.view.GravityCompat;
+import androidx.drawerlayout.widget.DrawerLayout;
+import androidx.fragment.app.Fragment;
+
+import com.expenseos.R;
+import com.expenseos.android.timesheet.TimesheetActivity;
+import com.expenseos.ui.backup.BackupFragment;
+import com.expenseos.ui.home.HomeFragment;
+
+public class HomeActivity extends AppCompatActivity {
+
+    private int bookId;
+    private String bookName;
+    private DrawerLayout drawerLayout;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private static final int NAV_HOME = 0;
+    private static final int NAV_LOG = 1;           // Sync Console tab
+    private static final int NAV_BACKUP = 2;        // Scheduler tab
+    private static final int NAV_CONFIG = 3;
+    private int currentNav = NAV_HOME;
+
+    @Override
+    protected void onCreate(Bundle s) {
+        super.onCreate(s);
+        setContentView(R.layout.activity_home);
+        com.expenseos.util.UiUtils.styleStatusBar(getWindow(), this);
+        getWindow().setBackgroundDrawableResource(R.drawable.aurora_bg);
+        ((androidx.drawerlayout.widget.DrawerLayout) findViewById(R.id.drawerLayout))
+                .setStatusBarBackgroundColor(android.graphics.Color.TRANSPARENT);
+
+//        SharedPreferences prefs = getSharedPreferences("expenseos_prefs", MODE_PRIVATE);
+//        bookId = prefs.getInt("active_book_id", 0);
+//        bookName = prefs.getString("active_book_name", "");
+        com.expenseos.util.AppConfig cfg = com.expenseos.util.AppConfig.get(this);
+        bookId = cfg.getActiveBookId();
+        bookName = cfg.getActiveBookName();
+
+        if (bookId <= 0) {
+            startActivity(new Intent(this, MainActivity.class));
+            finish();
+            return;
+        }
+
+        // Global search — reachable from every tab of the shell.
+        View searchBtn = findViewById(R.id.btnGlobalSearch);
+        if (searchBtn != null) {
+            searchBtn.setOnClickListener(v ->
+                    startActivity(new Intent(this, GlobalSearchActivity.class)));
+        }
+
+        drawerLayout = findViewById(R.id.drawerLayout);
+        ((TextView) findViewById(R.id.tvBookTitle)).setText(bookName);
+        ((TextView) findViewById(R.id.drawerBookName)).setText("📒 " + bookName);
+
+//        com.expenseos.sync.BackupScheduler.scheduleDaily(this);
+
+        com.expenseos.scheduler.SchedulerWorker.schedulePeriodic(this);   // <-- add this
+        com.expenseos.scheduler.SchedulerWorker.ensureMonthlyCategoryReportScheduler(this);
+
+        setupBottomNav();
+        setupDrawer();
+        setupCalendarButton();
+//        setupFab();
+
+        // Load HOME tab by default
+        loadTab(NAV_HOME);
+    }
+
+    // ── FAB — quick add entry (Income / Expense sheet) ────
+    private void setupFab() {
+        com.google.android.material.floatingactionbutton.FloatingActionButton fab =
+                findViewById(R.id.fabAdd);
+        if (fab == null) return;
+
+        fab.setOnClickListener(v -> {
+            View sheetView = LayoutInflater.from(this)
+                    .inflate(R.layout.sheet_add_choice, null);
+
+            com.google.android.material.bottomsheet.BottomSheetDialog sheet =
+                    new com.google.android.material.bottomsheet.BottomSheetDialog(this);
+            sheet.setContentView(sheetView);
+
+            View btnIncome = sheetView.findViewById(R.id.btnPickIncome);
+            View btnExpense = sheetView.findViewById(R.id.btnPickExpense);
+
+            if (btnIncome != null) btnIncome.setOnClickListener(ic -> {
+                sheet.dismiss();
+                openEntryScreen("INCOME");
+            });
+            if (btnExpense != null) btnExpense.setOnClickListener(ec -> {
+                sheet.dismiss();
+                openEntryScreen("EXPENSE");
+            });
+
+            sheet.show();
+        });
+    }
+
+    private void openEntryScreen(String type) {
+        Intent i = new Intent(this, TransactionEntryActivity.class);
+        i.putExtra("type", type);
+        startActivity(i);
+    }
+
+    // ── Bottom Navigation ─────────────────────────────────
+    private void setupBottomNav() {
+        // Glass design: iOS-style press scale on every nav item.
+        com.expenseos.ui.glass.GlassUi.press(findViewById(R.id.navHome));
+        com.expenseos.ui.glass.GlassUi.press(findViewById(R.id.navLog));
+        com.expenseos.ui.glass.GlassUi.press(findViewById(R.id.navBackup));
+        com.expenseos.ui.glass.GlassUi.press(findViewById(R.id.navConfig));
+        findViewById(R.id.navHome).setOnClickListener(v -> loadTab(NAV_HOME));
+//        findViewById(R.id.navReports).setOnClickListener(v -> loadTab(NAV_REPORTS));
+        findViewById(R.id.navLog).setOnClickListener(v -> loadTab(NAV_LOG));               // <-- new
+        findViewById(R.id.navBackup).setOnClickListener(v ->
+                startActivity(new Intent(this, SchedulerActivity.class)));  // Scheduler tab
+        findViewById(R.id.navConfig).setOnClickListener(v -> {
+            Intent i = new Intent(this, SettingsActivity.class);
+            i.putExtra("bookScoped", true);
+            i.putExtra("bookId", bookId);
+            startActivity(i);
+        });
+    }
+
+    private void loadTab(int tab) {
+        // Re-tapping the already-active tab should NOT reload the fragment
+        // (prevents flicker + scroll position loss on the visible list).
+        if (currentNav == tab && getSupportFragmentManager()
+                .findFragmentById(R.id.fragmentContainer) != null) {
+            updateNavHighlight(tab);
+            return;
+        }
+        currentNav = tab;
+        updateNavHighlight(tab);
+
+        // ── Use HomeFragment / ReportsFragment / BackupFragment / ConfigFragment
+        Fragment frag;
+        switch (tab) {
+//            case NAV_REPORTS:
+//                frag = new ReportsFragment();
+//                break;
+            case NAV_LOG:
+                frag = new com.expenseos.ui.settings.ConsoleFragment();   // <-- reuse existing fragment
+                break;
+            case NAV_BACKUP:
+                frag = new BackupFragment();
+                break;
+            case NAV_CONFIG:
+                frag = new ConfigFragment();
+                break;
+            default:
+                frag = new HomeFragment();
+                break; // ← HomeFragment (not DashboardFragment)
+        }
+
+        getSupportFragmentManager().beginTransaction()
+                .setCustomAnimations(R.anim.fragment_fade_in, R.anim.fragment_fade_out)
+                .replace(R.id.fragmentContainer, frag)
+                .commit();
+    }
+
+    private void updateNavHighlight(int tab) {
+        int[][] navLabelSets = {{R.id.navHomeLabel, NAV_HOME}, {R.id.navLogLabel, NAV_LOG},
+                {R.id.navBackupLabel, NAV_BACKUP}, {R.id.navConfigLabel, NAV_CONFIG}};
+        for (int[] set : navLabelSets) {
+            TextView lbl = findViewById(set[0]);
+            if (lbl != null)
+                lbl.setTextColor(getResources().getColor(set[1] == tab ? R.color.primary : R.color.text_muted, null));
+        }
+
+        // Home — plain single-color line icon, colorFilter tint pannalam.
+        android.widget.ImageView homeIcon = findViewById(R.id.navHomeIcon);
+        if (homeIcon != null)
+            homeIcon.setColorFilter(getResources().getColor(tab == NAV_HOME ? R.color.primary : R.color.text_muted, null));
+
+        // Log/Scheduler/Config — full-color gradient icons, colorFilter apply
+        // pannina gradient mறைந்து poidum. Selection-ah alpha vachi kaatunga.
+        int[][] gradientIconSets = {{R.id.navLogIcon, NAV_LOG}, {R.id.navBackupIcon, NAV_BACKUP},
+                {R.id.navConfigIcon, NAV_CONFIG}};
+        for (int[] set : gradientIconSets) {
+            android.widget.ImageView icon = findViewById(set[0]);
+            if (icon != null) {
+                icon.clearColorFilter();
+                icon.setAlpha(set[1] == tab ? 1f : 0.55f);
+            }
+        }
+    }
+
+    // ── Side Drawer ───────────────────────────────────────
+    private void setupDrawer() {
+        View btnHamburger = findViewById(R.id.btnHamburger);
+        if (btnHamburger != null)
+            btnHamburger.setOnClickListener(v -> drawerLayout.openDrawer(GravityCompat.START));
+
+        View drawerBooks = findViewById(R.id.drawerBooks);
+        if (drawerBooks != null) drawerBooks.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, MainActivity.class));
+        });
+
+//        View drawerSettings = findViewById(R.id.drawerSettings);
+//        if (drawerSettings != null) drawerSettings.setOnClickListener(v -> {
+//            drawerLayout.closeDrawer(GravityCompat.START);
+//            Intent i = new Intent(this, SettingsActivity.class);
+//            i.putExtra("bookScoped", true);
+//            i.putExtra("bookId", bookId);
+//            startActivity(i);
+//        });
+        View drawerSettings = findViewById(R.id.drawerSettings);
+        if (drawerSettings != null) drawerSettings.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, ConfigActivity.class));
+        });
+
+        View drawerAudit = findViewById(R.id.drawerAudit);
+        if (drawerAudit != null) drawerAudit.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, AuditLogActivity.class));
+        });
+
+        View drawerBudget = findViewById(R.id.drawerBudget);
+        if (drawerBudget != null) drawerBudget.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            Intent i = new Intent(this, BudgetActivity.class);
+            i.putExtra("bookId", bookId);
+            startActivity(i);
+        });
+
+        View drawerConfigureBudget = findViewById(R.id.drawerConfigureBudget);
+        if (drawerConfigureBudget != null) drawerConfigureBudget.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, BudgetConfigActivity.class));
+        });
+
+        View drawerScheduler = findViewById(R.id.drawerScheduler);
+        if (drawerScheduler != null) drawerScheduler.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, BackupActivity.class));  // Backup screen
+        });
+
+        // NEW
+// NEW
+        View drawerMonthlyReport = findViewById(R.id.drawerMonthlyReport);
+        if (drawerMonthlyReport != null) drawerMonthlyReport.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            Intent i = new Intent(this, MonthlyCategoryReportActivity.class);
+            i.putExtra("bookId", bookId);
+            startActivity(i);
+        });
+
+        View drawerSequence = findViewById(R.id.drawerSequence);
+        if (drawerSequence != null) drawerSequence.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, SequenceActivity.class));
+        });
+
+// NEW
+        View drawerBulkAdd = findViewById(R.id.drawerBulkAdd);
+        if (drawerBulkAdd != null) drawerBulkAdd.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, BulkAddActivity.class));
+        });
+
+        View drawerImportExcel = findViewById(R.id.drawerImportExcel);
+        if (drawerImportExcel != null) drawerImportExcel.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, ImportExcelActivity.class));
+        });
+
+        View drawerRecycleBin = findViewById(R.id.drawerRecycleBin);
+        if (drawerRecycleBin != null) drawerRecycleBin.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            Intent i = new Intent(this, RecycleBinActivity.class);
+            i.putExtra("bookId", bookId);
+            startActivity(i);
+        });
+
+        View drawerSqlConsole = findViewById(R.id.drawerSqlConsole);
+        if (drawerSqlConsole != null) drawerSqlConsole.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, SqlConsoleActivity.class));
+        });
+
+        View drawerTimesheet = findViewById(R.id.drawerTimesheet);
+        if (drawerTimesheet != null) drawerTimesheet.setOnClickListener(v -> {
+            drawerLayout.closeDrawer(GravityCompat.START);
+            startActivity(new Intent(this, TimesheetActivity.class));
+        });
+    }
+
+    // ── Sync Button ───────────────────────────────────────
+  /*  private void setupSync() {
+        Button btnSync = findViewById(R.id.btnSync);
+        if (btnSync == null) return;
+
+        btnSync.setOnClickListener(v -> {
+            btnSync.setEnabled(false);
+            btnSync.setText("Syncing…");
+
+            // Chain push (syncToCloud) then pull (fetchFromCloud) — the real
+            // SyncManager singleton doesn't expose one combined "sync" call.
+            SyncManager.get().syncToCloud(this, new SyncManager.SyncCallback() {
+                @Override
+                public void onComplete(boolean pushOk, String pushSummary) {
+                    if (!pushOk) {
+                        mainHandler.post(() -> {
+                            btnSync.setEnabled(true);
+                            btnSync.setText("⟳ Sync");
+                            com.expenseos.util.UiUtils.toast(HomeActivity.this, "Sync failed: " + pushSummary);
+                        });
+                        return;
+                    }
+
+                    SyncManager.get().fetchFromCloud(HomeActivity.this, new SyncManager.SyncCallback() {
+                        @Override
+                        public void onComplete(boolean pullOk, String pullSummary) {
+                            mainHandler.post(() -> {
+                                btnSync.setEnabled(true);
+                                btnSync.setText("⟳ Sync");
+                                if (pullOk) {
+                                    com.expenseos.util.UiUtils.toast(HomeActivity.this, pushSummary + " | " + pullSummary);
+                                    // Refresh current fragment — do NOT call loadTab() — causes page jump
+                                    Fragment cur = getSupportFragmentManager().findFragmentById(R.id.fragmentContainer);
+                                    if (cur instanceof HomeFragment)
+                                        ((HomeFragment) cur).refreshData();
+                                } else {
+                                    com.expenseos.util.UiUtils.toast(HomeActivity.this, "Sync failed: " + pullSummary);
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+        });
+    } */
+
+    // ── Calendar View Button ──────────────────────────────
+    // Was the header "Sync" button — sync is still reachable via the
+    // "Sync to Cloud"/"Fetch from Cloud" buttons inside the Home tab itself.
+//    private void setupCalendarButton() {
+//        Button btnCalendar = findViewById(R.id.btnCalendarView);
+//        if (btnCalendar == null) return;
+//        btnCalendar.setOnClickListener(v -> {
+//            Intent i = new Intent(this, CalendarViewActivity.class);
+//            i.putExtra("bookId", bookId);
+//            startActivity(i);
+//        });
+//    }
+
+    @Override
+    public void onBackPressed() {
+        if (drawerLayout != null && drawerLayout.isDrawerOpen(GravityCompat.START))
+            drawerLayout.closeDrawer(GravityCompat.START);
+        else super.onBackPressed();
+    }
+
+    private void setupCalendarButton() {
+        ImageButton btnCalendar = findViewById(R.id.btnCalendarView);
+        if (btnCalendar == null) return;
+        btnCalendar.setOnClickListener(v -> {
+            Intent i = new Intent(this, CalendarViewActivity.class);
+            i.putExtra("bookId", bookId);
+            startActivity(i);
+        });
+    }
+}

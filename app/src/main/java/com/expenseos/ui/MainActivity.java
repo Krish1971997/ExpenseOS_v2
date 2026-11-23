@@ -1,0 +1,534 @@
+package com.expenseos.ui;
+
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+import android.text.Editable;
+import android.text.TextWatcher;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.ImageButton;
+import android.widget.PopupMenu;
+import android.widget.Switch;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
+
+import com.expenseos.R;
+import com.expenseos.dao.CashBookDao;
+import com.expenseos.model.CashBook;
+import com.expenseos.util.AppConfig;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Map;
+
+public class MainActivity extends AppCompatActivity {
+
+    private CashBookDao dao;
+    private List<CashBook> books = new java.util.ArrayList<>();
+    private final Map<Integer, Map<String, BigDecimal>> summaries = new java.util.HashMap<>();
+    private int loadSeq = 0;   // ignore results of older, overlapping loads
+    private String search = null;
+    private String sort = null; // null=updated, name_asc, balance_desc, balance_asc, created
+    private static final int REQ_SMS_PERMISSION = 101;
+
+    private android.view.View premiumLoader;
+    private boolean premiumLoaderGone = false;
+
+
+    @Override
+    protected void onCreate(Bundle s) {
+        super.onCreate(s);
+        if (!com.expenseos.util.AuthManager.isLoggedIn(this) || !AppConfig.get(this).isConfigured()) {
+            startActivity(new Intent(this, LoginActivity.class));
+            finish();
+            return;
+        }
+        boolean manageBooks = getIntent().getBooleanExtra("manage", false);
+        if (!manageBooks && hasValidActiveBook()) {
+            startActivity(new Intent(this, ShellActivity.class));
+            finish();
+            return;
+        }
+        setContentView(R.layout.activity_main);
+        if (manageBooks || !hasValidActiveBook())
+            findViewById(R.id.mainBottomNav).setVisibility(android.view.View.GONE);
+        com.expenseos.util.UiUtils.styleStatusBar(getWindow(), this);
+        // Splash theme's blue window background shows behind the transparent bars; switch to the app background
+        getWindow().setBackgroundDrawableResource(R.drawable.aurora_bg);
+        dao = new CashBookDao(this);
+
+        // Premium cold-start loader — shown while the shell initialises, then faded out.
+        try {
+            android.view.ViewGroup rootView = findViewById(android.R.id.content);
+            premiumLoader = android.view.LayoutInflater.from(this)
+                    .inflate(R.layout.view_premium_loading, rootView, false);
+            rootView.addView(premiumLoader);
+            premiumLoader.setAlpha(0f);
+            premiumLoader.animate().alpha(1f).setDuration(160).start();
+            rootView.postDelayed(this::dismissPremiumLoader, 550);
+        } catch (Throwable ignored) {
+        }
+
+        com.expenseos.util.ReminderScheduler.scheduleDaily9PM(this);
+        requestNotificationPermissionIfNeeded();
+
+        com.expenseos.scheduler.SchedulerWorker.schedulePeriodic(this);
+        // after the first frame, so startup isn't slowed
+        getWindow().getDecorView().post(() -> com.expenseos.cloud.CloudWarmup.start(this));
+
+        // ── Bottom nav: Cashbooks / Stats / AI Bot / More ──
+        findViewById(R.id.navCashbooks).setOnClickListener(v -> {
+            // Already on this screen — just refresh and flash the list.
+            scrollToTop();
+            loadBooks();
+        });
+
+        findViewById(R.id.navStats).setOnClickListener(v -> {
+            markNavSelected(R.id.navStats, R.id.navStatsIcon, R.id.navStatsLabel);
+            startActivity(new Intent(this, StatsActivity.class));
+        });
+
+        findViewById(R.id.navAiAssistant).setOnClickListener(v -> {
+            markNavSelected(R.id.navAiAssistant, R.id.navAiIcon, R.id.navAiAssistantLabel);
+            startActivity(new Intent(this, ChatActivity.class));
+        });
+
+        // Passbook (SMS) — needs the SMS permission before it can parse the inbox.
+        findViewById(R.id.navPassbook).setOnClickListener(v -> {
+            markNavSelected(R.id.navPassbook, R.id.navPassbookIcon, R.id.navPassbookLabel);
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                        new String[]{Manifest.permission.READ_SMS}, REQ_SMS_PERMISSION);
+            } else {
+                startActivity(new Intent(this, PassbookActivity.class));
+            }
+        });
+
+        findViewById(R.id.navFoodTracker).setOnClickListener(v -> {
+            markNavSelected(R.id.navFoodTracker, R.id.navFoodIcon, R.id.navFoodLabel);
+            startActivity(new Intent(this, FoodTrackerActivity.class));
+        });
+
+        findViewById(R.id.navMore).setOnClickListener(v -> {
+            markNavSelected(R.id.navMore, R.id.navMoreIcon, R.id.navMoreLabel);
+            showMoreSheet();
+        });
+
+        // Global search — tap the box or the icon → search screen opens with keyboard.
+        View.OnClickListener openGlobalSearch = v ->
+                startActivity(new Intent(this, GlobalSearchActivity.class));
+        findViewById(R.id.etGlobalSearch).setOnClickListener(openGlobalSearch);
+        findViewById(R.id.btnGlobalSearch).setOnClickListener(openGlobalSearch);
+
+        // New Book
+        findViewById(R.id.btnNewBook).setOnClickListener(v -> showNewBookDialog());
+
+        // Search bar
+        EditText etSearch = findViewById(R.id.etBookSearch);
+        etSearch.addTextChangedListener(new TextWatcher() {
+            public void afterTextChanged(Editable e) {
+                search = e.toString().trim().isEmpty() ? null : e.toString().trim();
+                loadBooks();
+            }
+
+            public void beforeTextChanged(CharSequence s, int st, int c, int a) {
+            }
+
+            public void onTextChanged(CharSequence s, int st, int b, int c) {
+            }
+        });
+
+        // Sort button
+        findViewById(R.id.btnBookSort).setOnClickListener(v -> showSortDialog());
+
+        loadBooks();
+    }
+
+    /**
+     * Scroll the book list back to the top when the active tab is re-tapped.
+     */
+    private void scrollToTop() {
+        RecyclerView rv = findViewById(R.id.rvBooks);
+        com.expenseos.util.UiUtils.tuneList(rv);
+        if (rv != null) rv.smoothScrollToPosition(0);
+    }
+
+    /**
+     * Momentary highlight on a nav tab while its screen opens.
+     */
+    private void markNavSelected(int tabId, int iconId, int labelId) {
+        View tab = findViewById(tabId);
+        if (tab == null) return;
+        View icon = tab.findViewById(iconId);
+        View label = tab.findViewById(labelId);
+        if (icon != null) icon.animate().alpha(1f).setDuration(120).start();
+        if (label != null) label.animate().alpha(1f).setDuration(120).start();
+        // Reset on the next resume — onResume() re-renders the list anyway,
+        // and the selection colour is restored by the returning animation.
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        resetNavTint();
+        loadBooks();
+    }
+
+    private void resetNavTint() {
+        int[][] sets = {
+                {R.id.navStatsIcon, R.id.navStatsLabel},
+                {R.id.navAiIcon, R.id.navAiAssistantLabel},
+                {R.id.navPassbookIcon, R.id.navPassbookLabel},
+                {R.id.navFoodIcon, R.id.navFoodLabel},
+                {R.id.navMoreIcon, R.id.navMoreLabel}
+        };
+        for (int[] set : sets) {
+            View icon = findViewById(set[0]);
+            View label = findViewById(set[1]);
+            if (icon != null) icon.setAlpha(0.85f);
+            if (label != null) label.setAlpha(0.85f);
+        }
+    }
+
+    // ── "More" bottom sheet — secondary destinations ──────
+    private void showMoreSheet() {
+        View v = LayoutInflater.from(this).inflate(R.layout.sheet_more_menu, null);
+
+        com.google.android.material.bottomsheet.BottomSheetDialog sheet =
+                new com.google.android.material.bottomsheet.BottomSheetDialog(this);
+        sheet.setContentView(v);
+
+        View rowAllTxn = v.findViewById(R.id.rowAllTxn);
+        if (rowAllTxn != null) rowAllTxn.setOnClickListener(Click -> {
+            sheet.dismiss();
+            startActivity(new Intent(this, AllTransactionsActivity.class));
+        });
+
+        View rowIntegrations = v.findViewById(R.id.rowIntegrations);
+        if (rowIntegrations != null) rowIntegrations.setOnClickListener(Click -> {
+            sheet.dismiss();
+            startActivity(new Intent(this, IntegrationsActivity.class));
+        });
+
+        View rowRestore = v.findViewById(R.id.rowRestoreCloud);
+        if (rowRestore != null) rowRestore.setOnClickListener(Click -> {
+            sheet.dismiss();
+            showRestoreCloudDialog();
+        });
+
+        sheet.show();
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1001);
+        }
+    }
+
+    private void loadBooks() {
+        final int seq = ++loadSeq;
+        final String s = search, so = sort;
+        new Thread(() -> {
+            // all DB work off the main thread
+            List<CashBook> list = dao.findAll(s, so);
+            Map<Integer, Map<String, BigDecimal>> sums = new java.util.HashMap<>();
+            for (CashBook b : list) sums.put(b.getId(), dao.getSummary(b.getId()));
+
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed() || seq != loadSeq) return; // stale result
+                books = list;
+                summaries.clear();
+                summaries.putAll(sums);
+                RecyclerView rv = findViewById(R.id.rvBooks);
+                rv.setItemAnimator(new androidx.recyclerview.widget.DefaultItemAnimator());
+                rv.setLayoutManager(new LinearLayoutManager(this));
+                rv.setAdapter(new BookAdapter());
+                rv.scheduleLayoutAnimation(); // staggered fall-down entrance
+            });
+        }).start();
+    }
+
+    // ── Sort dialog ───────────────────────────────────────
+    private void showSortDialog() {
+        String[] opts = {"Last Updated", "Name (A-Z)", "Balance (High→Low)",
+                "Balance (Low→High)", "Last Created"};
+        String[] keys = {null, "name_asc", "balance_desc", "balance_asc", "created"};
+        int cur = 0;
+        for (int i = 0; i < keys.length; i++)
+            if ((keys[i] == null && sort == null) || (keys[i] != null && keys[i].equals(sort))) {
+                cur = i;
+                break;
+            }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Sort Books")
+                .setSingleChoiceItems(opts, cur, null)
+                .setPositiveButton("Apply", (d, w) -> {
+                    int sel = ((AlertDialog) d).getListView().getCheckedItemPosition();
+                    sort = keys[Math.max(0, sel)];
+                    loadBooks();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    // ── New book dialog ───────────────────────────────────
+    private void showNewBookDialog() {
+        View v = LayoutInflater.from(this).inflate(R.layout.dialog_new_book, null);
+        EditText etName = v.findViewById(R.id.et_book_name);
+        EditText etDesc = v.findViewById(R.id.et_book_desc);
+        new AlertDialog.Builder(this)
+                .setTitle("New Cash Book")
+                .setView(v)
+                .setPositiveButton("Create & Open", (d, w) -> {
+                    String name = etName.getText().toString().trim();
+                    if (name.isEmpty()) return;
+                    int id = (int) dao.insert(name, etDesc.getText().toString().trim());
+                    openBook(id, name);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private boolean hasValidActiveBook() {
+        int id = AppConfig.get(this).getActiveBookId();
+        return id > 0 && new CashBookDao(this).findById(id) != null;
+    }
+
+    private void openBook(int id, String name) {
+        AppConfig.get(this).setActiveBook(id, name);
+        Intent shell = new Intent(this, ShellActivity.class);
+        shell.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        startActivity(shell);
+        finish();
+    }
+
+    // ── Inner RecyclerView adapter ────────────────────────
+    class BookAdapter extends RecyclerView.Adapter<BookAdapter.VH> {
+
+        class VH extends RecyclerView.ViewHolder {
+            View row;
+            TextView tvName, tvCreated, tvNet;
+            View vStatusBar;
+            ImageButton btnMenu;
+
+            VH(View v) {
+                super(v);
+                row = v.findViewById(R.id.row_book_item);
+                tvName = v.findViewById(R.id.tv_book_name);
+                tvCreated = v.findViewById(R.id.tv_book_created);
+                vStatusBar = v.findViewById(R.id.v_book_status_bar);
+                tvNet = v.findViewById(R.id.tv_book_net);
+                btnMenu = v.findViewById(R.id.btn_book_menu);
+            }
+        }
+
+        @Override
+        public VH onCreateViewHolder(android.view.ViewGroup p, int t) {
+            return new VH(LayoutInflater.from(p.getContext())
+                    .inflate(R.layout.item_book, p, false));
+        }
+
+        @Override
+        public void onBindViewHolder(VH h, int pos) {
+            CashBook b = books.get(pos);
+            Map<String, BigDecimal> sum = summaries.containsKey(b.getId())
+                    ? summaries.get(b.getId()) : new java.util.HashMap<>();
+            BigDecimal income = sum.getOrDefault("income", BigDecimal.ZERO);
+            BigDecimal expense = sum.getOrDefault("expense", BigDecimal.ZERO);
+            BigDecimal net = income.subtract(expense);
+
+            h.tvName.setText(b.getName());
+            h.tvCreated.setText(b.getStatusLabel());
+
+            boolean negative = net.signum() < 0;
+            h.tvNet.setText((negative ? "-₹" : "₹") + String.format("%,.2f", net.abs()));
+            h.tvNet.setTextColor(androidx.core.content.ContextCompat.getColor(
+                    h.itemView.getContext(), negative ? R.color.danger : R.color.green));
+
+            if (h.vStatusBar != null) {
+                int statusColor = androidx.core.content.ContextCompat.getColor(
+                        h.itemView.getContext(), b.isActive() ? R.color.green : R.color.danger);
+                h.vStatusBar.setBackgroundColor(statusColor);
+            }
+
+            h.row.setOnClickListener(v -> openBook(b.getId(), b.getName()));
+
+            h.btnMenu.setOnClickListener(v -> {
+                PopupMenu popup = new PopupMenu(MainActivity.this, v);
+                popup.getMenu().add(0, 1, 0, "Open");
+                popup.getMenu().add(0, 2, 1, "Edit");
+                popup.getMenu().add(0, 3, 2, "Delete");
+                popup.setOnMenuItemClickListener(item -> {
+                    if (item.getItemId() == 1) {
+                        openBook(b.getId(), b.getName());
+                        return true;
+                    } else if (item.getItemId() == 2) {
+                        showEditDialog(b);
+                        return true;
+                    } else if (item.getItemId() == 3) {
+                        showDeleteBookDialog(b);
+                        return true;
+                    }
+                    return false;
+                });
+                popup.show();
+            });
+        }
+
+        @Override
+        public int getItemCount() {
+            return books.size();
+        }
+    }
+
+    // ── Edit book dialog ──────────────────────────────────
+    private void showEditDialog(CashBook b) {
+        View v = LayoutInflater.from(this).inflate(R.layout.dialog_edit_book, null);
+        EditText etName = v.findViewById(R.id.etEditBookName);
+        EditText etDesc = v.findViewById(R.id.etEditBookDesc);
+        Switch swActive = v.findViewById(R.id.swEditBookActive);
+
+        etName.setText(b.getName());
+        etDesc.setText(b.getDescription() != null ? b.getDescription() : "");
+        swActive.setChecked(b.isActive());
+
+        new AlertDialog.Builder(this)
+                .setTitle("Edit Cash Book")
+                .setView(v)
+                .setPositiveButton("Save", (d, w) -> {
+                    String name = etName.getText().toString().trim();
+                    if (name.isEmpty()) return;
+                    dao.update(b.getId(), name,
+                            etDesc.getText().toString().trim(),
+                            swActive.isChecked());
+                    loadBooks();
+                    Toast.makeText(this, "Saved!", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void showDeleteBookDialog(CashBook book) {
+        View v = LayoutInflater.from(this).inflate(R.layout.dialog_delete_book, null);
+        TextView tvMsg = v.findViewById(R.id.tvDeleteConfirmMsg);
+        EditText etConfirm = v.findViewById(R.id.etDeleteBookName);
+        tvMsg.setText("Please type " + book.getName() + " to confirm");
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Delete " + book.getName() + " ?")
+                .setView(v)
+                .setPositiveButton("Delete", null)
+                .setNegativeButton("Cancel", null)
+                .create();
+
+        dialog.setOnShowListener(d -> {
+            Button deleteBtn = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            deleteBtn.setEnabled(false);
+
+            etConfirm.addTextChangedListener(new TextWatcher() {
+                public void afterTextChanged(Editable s) {
+                    deleteBtn.setEnabled(s.toString().equals(book.getName()));
+                }
+
+                public void beforeTextChanged(CharSequence s, int a, int c, int cn) {
+                }
+
+                public void onTextChanged(CharSequence s, int a, int b2, int c) {
+                }
+            });
+
+            deleteBtn.setOnClickListener(view -> {
+                dao.deleteCascade(book.getId());
+
+                AppConfig cfg = AppConfig.get(this);
+                if (cfg.getActiveBookId() == book.getId()) {
+                    cfg.setActiveBook(0, null);
+                }
+
+                Toast.makeText(this, "Book deleted", Toast.LENGTH_SHORT).show();
+                dialog.dismiss();
+                loadBooks();
+            });
+        });
+
+        dialog.show();
+    }
+
+    public void updateBookLabel() {
+        String bookName = AppConfig.get(this).getActiveBookName();
+        if (getSupportActionBar() != null) {
+            getSupportActionBar().setSubtitle("● " + bookName);
+        }
+    }
+
+    private void showRestoreCloudDialog() {
+        AppConfig cfg = AppConfig.get(this);
+        View v = LayoutInflater.from(this).inflate(R.layout.dialog_cloud_restore, null);
+        EditText etUrl = v.findViewById(R.id.etRestoreDbUrl);
+        EditText etUser = v.findViewById(R.id.etRestoreDbUser);
+        EditText etPass = v.findViewById(R.id.etRestoreDbPass);
+
+        etUrl.setText(cfg.getDbUrl());
+        etUser.setText(cfg.getDbUser());
+        etPass.setText(cfg.getDbPassword());
+
+        new AlertDialog.Builder(this)
+                .setTitle("☁ Restore from Cloud")
+                .setMessage("This will pull down all cash books, categories, and transactions from the cloud.")
+                .setView(v)
+                .setPositiveButton("Restore", (d, w) -> {
+                    String url = etUrl.getText().toString().trim();
+                    String user = etUser.getText().toString().trim();
+                    String pass = etPass.getText().toString().trim();
+                    if (url.isEmpty()) {
+                        Toast.makeText(this, "DB URL is required", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    cfg.setDb(url, user, pass);
+                    doCloudRestore();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void doCloudRestore() {
+        RestoreProgressDialog.run(this, ok -> {
+            if (ok) loadBooks();
+        });
+    }
+
+    // ── Premium cold-start loader ────────────────────────────────────
+    private void dismissPremiumLoader() {
+        if (premiumLoaderGone || premiumLoader == null) return;
+        premiumLoaderGone = true;
+        final android.view.View v = premiumLoader;
+        premiumLoader = null;
+        v.animate().alpha(0f).setDuration(220).withEndAction(() -> {
+            android.view.ViewGroup parent = (android.view.ViewGroup) v.getParent();
+            if (parent != null) parent.removeView(v);
+        }).start();
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(android.view.MotionEvent ev) {
+        dismissPremiumLoader(); // any tap reveals the app immediately
+        return super.dispatchTouchEvent(ev);
+    }
+}

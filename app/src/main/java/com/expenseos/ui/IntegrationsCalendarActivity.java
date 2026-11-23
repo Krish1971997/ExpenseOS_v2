@@ -1,0 +1,478 @@
+package com.expenseos.ui;
+
+import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Bundle;
+import android.view.LayoutInflater;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.TextView;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.graphics.ColorUtils;
+import androidx.recyclerview.widget.GridLayoutManager;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
+
+import com.expenseos.R;
+import com.expenseos.dao.TaskDao;
+import com.expenseos.model.Task;
+import com.expenseos.util.SwipeNavHelper;
+import com.google.android.material.tabs.TabLayout;
+
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.time.format.DateTimeFormatter;
+import java.time.format.TextStyle;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+/**
+ * Task/reminder calendar for the Integrations tab — separate from
+ * CalendarViewActivity (which is the per-cashbook transaction calendar).
+ * Uses the `tasks` table, no bookId scoping.
+ */
+public class IntegrationsCalendarActivity extends AppCompatActivity {
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
+    private TaskDao taskDao;
+    private YearMonth currentMonth;
+    private LocalDate currentDay;
+    private boolean listMode = false; // calendar vs flat list toggle
+    private int viewMode = 0; // 0=Month 1=Week 2=Day 3=Year
+    private SwipeNavHelper swipe;
+
+    @Override
+    protected void onCreate(Bundle s) {
+
+        super.onCreate(s);
+        setContentView(R.layout.activity_integrations_calendar);
+        taskDao = new TaskDao(this);
+        currentMonth = YearMonth.now();
+        currentDay = LocalDate.now();
+
+        com.google.android.material.bottomnavigation.BottomNavigationView bottomNav = findViewById(R.id.bottomNavIntegrationsCal);
+        bottomNav.setSelectedItemId(R.id.navCalendar);
+        bottomNav.setOnItemSelectedListener(item -> {
+            if (item.getItemId() == R.id.navConfig) {
+                startActivity(new Intent(this, IntegrationsActivity.class));
+                overridePendingTransition(R.anim.fade_in, R.anim.fade_out);
+                finish();
+                return true;
+            }
+            return true;
+        });
+
+        findViewById(R.id.btnCalBack).setOnClickListener(v -> finish());
+        findViewById(R.id.btnCalPrev).setOnClickListener(v -> step(-1));
+        findViewById(R.id.btnCalNext).setOnClickListener(v -> step(1));
+        findViewById(R.id.btnToggleList).setOnClickListener(v -> {
+            listMode = !listMode;
+            render();
+        });
+
+        TabLayout tabs = findViewById(R.id.tabViewMode);
+        tabs.addTab(tabs.newTab().setText("Month"));
+        tabs.addTab(tabs.newTab().setText("Week"));
+        tabs.addTab(tabs.newTab().setText("Day"));
+        tabs.addTab(tabs.newTab().setText("Year"));
+        tabs.addOnTabSelectedListener(new TabLayout.OnTabSelectedListener() {
+            @Override
+            public void onTabSelected(TabLayout.Tab tab) {
+                viewMode = tab.getPosition();
+                render();
+            }
+
+            @Override
+            public void onTabUnselected(TabLayout.Tab tab) {
+            }
+
+            @Override
+            public void onTabReselected(TabLayout.Tab tab) {
+            }
+        });
+
+        // swipe: month / week / day / year step, same as the ◀ ▶ buttons
+        swipe = new SwipeNavHelper(this, new SwipeNavHelper.Callback() {
+            @Override
+            public void onPrev() {
+                step(-1);
+            }
+
+            @Override
+            public void onNext() {
+                step(1);
+            }
+        });
+
+        render();
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (swipe != null) swipe.onTouch(ev);
+        return super.dispatchTouchEvent(ev);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        render(); // refresh after returning from AddTaskActivity / DayTasksDialog actions
+    }
+
+    private void step(int dir) {
+        switch (viewMode) {
+            case 0:
+                currentMonth = currentMonth.plusMonths(dir);
+                break;
+            case 1:
+                currentDay = currentDay.plusWeeks(dir);
+                break;
+            case 2:
+                currentDay = currentDay.plusDays(dir);
+                break;
+            case 3:
+                currentMonth = currentMonth.plusYears(dir);
+                break;
+        }
+        render();
+        animateBody(dir);
+    }
+
+    /**
+     * Content slides in from the side we are moving towards.
+     */
+    private void animateBody(int dir) {
+        RecyclerView rv = findViewById(R.id.rvCalendarBody);
+        rv.animate().cancel();
+        rv.setTranslationX(getResources().getDisplayMetrics().density * 48 * dir);
+        rv.setAlpha(0.2f);
+        rv.animate().translationX(0).alpha(1f).setDuration(200).start();
+    }
+
+    private void render() {
+        RecyclerView rv = findViewById(R.id.rvCalendarBody);
+        TextView tvTitle = findViewById(R.id.tvCalTitle);
+        findViewById(R.id.btnToggleList).setVisibility(viewMode == 0 ? View.VISIBLE : View.GONE);
+        findViewById(R.id.rowWeekdays).setVisibility(viewMode == 0 && !listMode ? View.VISIBLE : View.GONE);
+
+        if (listMode && viewMode == 0) {
+            renderFlatList(rv, tvTitle);
+            return;
+        }
+
+        switch (viewMode) {
+            case 0:
+                renderMonth(rv, tvTitle);
+                break;
+            case 1:
+                renderWeek(rv, tvTitle);
+                break;
+            case 2:
+                renderDay(rv, tvTitle);
+                break;
+            case 3:
+                renderYear(rv, tvTitle);
+                break;
+        }
+    }
+
+    // ── Month grid (Google-Calendar style: coloured task chips per day) ──
+    private void renderMonth(RecyclerView rv, TextView tvTitle) {
+        tvTitle.setText(currentMonth.getMonth().getDisplayName(TextStyle.FULL, Locale.ENGLISH) + " " + currentMonth.getYear());
+
+        // cell height = grid height / rows → grid isn't measured yet on the first render
+        if (rv.getHeight() == 0) {
+            rv.post(() -> {
+                if (rv.getHeight() > 0 && viewMode == 0 && !listMode) renderMonth(rv, tvTitle);
+            });
+            return;
+        }
+
+        // group all tasks by day once (findAll is ordered by task_datetime)
+        Map<String, List<Task>> byDay = new HashMap<>();
+        for (Task t : taskDao.findAll()) {
+            if (t.getTaskDateTime() == null || t.getTaskDateTime().length() < 10) continue;
+            byDay.computeIfAbsent(t.getTaskDateTime().substring(0, 10), k -> new ArrayList<>()).add(t);
+        }
+
+        // full weeks: Sunday before the 1st .. Saturday after the last day (neighbour-month days dimmed)
+        LocalDate first = currentMonth.atDay(1);
+        int leading = first.getDayOfWeek().getValue() % 7;
+        LocalDate start = first.minusDays(leading);
+        int rows = (int) Math.ceil((leading + currentMonth.lengthOfMonth()) / 7.0);
+        List<LocalDate> cells = new ArrayList<>();
+        for (int i = 0; i < rows * 7; i++) cells.add(start.plusDays(i));
+
+        final float dp = getResources().getDisplayMetrics().density;
+        int gridH = rv.getHeight() - rv.getPaddingTop() - rv.getPaddingBottom();
+        final int cellH = Math.max((int) (72 * dp), gridH / rows);
+
+        rv.setLayoutManager(new GridLayoutManager(this, 7));
+        rv.setAdapter(new RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+            class VH extends RecyclerView.ViewHolder {
+                final TextView tvNum;
+                final TextView more;
+                final TextView[] chips = new TextView[4];
+
+                VH(View v) {
+                    super(v);
+                    tvNum = v.findViewById(R.id.tvDayNumber);
+                    more = v.findViewById(R.id.tvMore);
+                    chips[0] = v.findViewById(R.id.tvChip1);
+                    chips[1] = v.findViewById(R.id.tvChip2);
+                    chips[2] = v.findViewById(R.id.tvChip3);
+                    chips[3] = v.findViewById(R.id.tvChip4);
+                }
+            }
+
+            @NonNull
+            @Override
+            public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup p, int t) {
+                View v = LayoutInflater.from(p.getContext()).inflate(R.layout.item_integrations_calendar_day, p, false);
+                v.getLayoutParams().height = cellH;
+                return new VH(v);
+            }
+
+            @Override
+            public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int pos) {
+                VH h = (VH) holder;
+                LocalDate date = cells.get(pos);
+                boolean inMonth = YearMonth.from(date).equals(currentMonth);
+                boolean isToday = date.equals(LocalDate.now());
+
+                h.tvNum.setText(String.valueOf(date.getDayOfMonth()));
+                h.tvNum.setBackgroundResource(isToday ? R.drawable.bg_today_circle : 0);
+                h.tvNum.setTextColor(getColor(isToday ? android.R.color.white : R.color.text));
+                h.itemView.setAlpha(inMonth ? 1f : 0.45f);
+
+                List<Task> tasks = byDay.get(date.format(DATE_FMT));
+                int n = tasks == null ? 0 : tasks.size();
+                int avail = cellH - (int) (27 * dp);              // below the day number
+                int fit = Math.min(4, Math.max(1, avail / (int) (17 * dp)));
+                int show = n <= fit ? n : Math.max(1, Math.min(4, (avail - (int) (12 * dp)) / (int) (17 * dp)));
+
+                for (int i = 0; i < 4; i++) {
+                    if (i < show) {
+                        final Task chipTask = tasks.get(i);
+                        bindChip(h.chips[i], chipTask, dp);
+                        h.chips[i].setOnClickListener(v -> openTask(chipTask));
+                    } else {
+                        h.chips[i].setVisibility(View.GONE);
+                        h.chips[i].setOnClickListener(null);
+                    }
+                }
+                if (n > show) {
+                    h.more.setVisibility(View.VISIBLE);
+                    h.more.setText("+" + (n - show) + " more");
+                    h.more.setOnClickListener(v -> openDayDialog(date.format(DATE_FMT)));
+                } else {
+                    h.more.setVisibility(View.GONE);
+                    h.more.setOnClickListener(null);
+                }
+
+                h.itemView.setOnClickListener(v ->
+                        DayTasksDialog.show(IntegrationsCalendarActivity.this, date.format(DATE_FMT), () -> render()));
+            }
+
+            @Override
+            public int getItemCount() {
+                return cells.size();
+            }
+        });
+    }
+
+    /**
+     * Rounded chip in the task's colour (primary when none); text flips dark on light colours (e.g. Banana).
+     */
+    private void bindChip(TextView chip, Task t, float dp) {
+        int color;
+        try {
+            String hex = t.getColor();
+            color = (hex == null || hex.isEmpty()) ? getColor(R.color.primary) : Color.parseColor(hex);
+        } catch (IllegalArgumentException e) {
+            color = getColor(R.color.primary);
+        }
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(4 * dp);
+        bg.setColor(color);
+        chip.setBackground(bg);
+        chip.setTextColor(ColorUtils.calculateLuminance(color) > 0.6 ? 0xFF202124 : Color.WHITE);
+        chip.setText(t.getName());
+        chip.setVisibility(View.VISIBLE);
+    }
+
+    // ── Week: 7 rows, one per day, with task count ────────
+    private void renderWeek(RecyclerView rv, TextView tvTitle) {
+        LocalDate monday = currentDay.minusDays((currentDay.getDayOfWeek().getValue() + 6) % 7);
+        tvTitle.setText(monday.format(DateTimeFormatter.ofPattern("dd MMM")) + " – " +
+                monday.plusDays(6).format(DateTimeFormatter.ofPattern("dd MMM yyyy")));
+
+        List<LocalDate> week = new ArrayList<>();
+        for (int i = 0; i < 7; i++) week.add(monday.plusDays(i));
+
+        rv.setLayoutManager(new LinearLayoutManager(this));
+        rv.setAdapter(new RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+            class VH extends RecyclerView.ViewHolder {
+                final TextView tvLabel;
+                final TextView tvCount;
+
+                VH(View v) {
+                    super(v);
+                    tvLabel = v.findViewById(R.id.tvWeekDayLabel);
+                    tvCount = v.findViewById(R.id.tvWeekDayCount);
+                }
+            }
+
+            @NonNull
+            @Override
+            public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup p, int t) {
+                return new VH(LayoutInflater.from(p.getContext()).inflate(R.layout.item_calendar_week_row, p, false));
+            }
+
+            @Override
+            public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int pos) {
+                VH h = (VH) holder;
+                LocalDate d = week.get(pos);
+                List<Task> tasks = taskDao.findByDate(d.format(DATE_FMT));
+                h.tvLabel.setText(d.getDayOfWeek().getDisplayName(TextStyle.SHORT, Locale.ENGLISH) + ", "
+                        + d.format(DateTimeFormatter.ofPattern("dd MMM")));
+                h.tvCount.setText(tasks.isEmpty() ? "No tasks" : tasks.size() + " task(s)");
+                h.itemView.setOnClickListener(v ->
+                        DayTasksDialog.show(IntegrationsCalendarActivity.this, d.format(DATE_FMT), () -> render()));
+            }
+
+            @Override
+            public int getItemCount() {
+                return week.size();
+            }
+        });
+    }
+
+    // ── Day: just open the DayTasksDialog content inline as a list ──
+    private void renderDay(RecyclerView rv, TextView tvTitle) {
+        tvTitle.setText(currentDay.getDayOfWeek().getDisplayName(TextStyle.FULL, Locale.ENGLISH) + ", "
+                + currentDay.format(DateTimeFormatter.ofPattern("dd MMM yyyy")));
+        List<Task> tasks = taskDao.findByDate(currentDay.format(DATE_FMT));
+        renderTaskList(rv, tasks, currentDay.format(DATE_FMT));
+    }
+
+    // ── Year: 12 months, tap a month -> jump to Month view ────
+    private void renderYear(RecyclerView rv, TextView tvTitle) {
+        int year = currentMonth.getYear();
+        tvTitle.setText(String.valueOf(year));
+        List<YearMonth> months = new ArrayList<>();
+        for (int m = 1; m <= 12; m++) months.add(YearMonth.of(year, m));
+
+        rv.setLayoutManager(new GridLayoutManager(this, 3));
+        rv.setAdapter(new RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+            class VH extends RecyclerView.ViewHolder {
+                final TextView tvMonth;
+                final TextView tvCount;
+
+                VH(View v) {
+                    super(v);
+                    tvMonth = v.findViewById(R.id.tvYearMonthLabel);
+                    tvCount = v.findViewById(R.id.tvYearMonthCount);
+                }
+            }
+
+            @NonNull
+            @Override
+            public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup p, int t) {
+                return new VH(LayoutInflater.from(p.getContext()).inflate(R.layout.item_calendar_year_month, p, false));
+            }
+
+            @Override
+            public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int pos) {
+                VH h = (VH) holder;
+                YearMonth ym = months.get(pos);
+                int count = taskDao.findDatesInMonth(ym.toString().substring(0, 7)).size();
+                h.tvMonth.setText(ym.getMonth().getDisplayName(TextStyle.SHORT, Locale.ENGLISH));
+                h.tvCount.setText(count > 0 ? count + " day(s)" : "");
+                h.itemView.setOnClickListener(v -> {
+                    currentMonth = ym;
+                    viewMode = 0;
+                    ((TabLayout) findViewById(R.id.tabViewMode)).getTabAt(0).select();
+                });
+            }
+
+            @Override
+            public int getItemCount() {
+                return months.size();
+            }
+        });
+    }
+
+    // ── Flat list toggle (all upcoming tasks) ─────────────
+    private void renderFlatList(RecyclerView rv, TextView tvTitle) {
+        tvTitle.setText("All tasks — " + currentMonth.getMonth().getDisplayName(TextStyle.FULL, Locale.ENGLISH) + " " + currentMonth.getYear());
+        List<Task> all = new ArrayList<>();
+        for (String d : taskDao.findDatesInMonth(currentMonth.toString().substring(0, 7)))
+            all.addAll(taskDao.findByDate(d));
+        renderTaskList(rv, all, null);
+    }
+
+    private void renderTaskList(RecyclerView rv, List<Task> tasks, String fixedDateForAdd) {
+        rv.setLayoutManager(new LinearLayoutManager(this));
+        rv.setAdapter(new RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+            class VH extends RecyclerView.ViewHolder {
+                final TextView tvName;
+                final TextView tvWhen;
+
+                VH(View v) {
+                    super(v);
+                    tvName = v.findViewById(R.id.tvFlatTaskName);
+                    tvWhen = v.findViewById(R.id.tvFlatTaskWhen);
+                }
+            }
+
+            @NonNull
+            @Override
+            public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup p, int t) {
+                return new VH(LayoutInflater.from(p.getContext()).inflate(R.layout.item_calendar_flat_task, p, false));
+            }
+
+            @Override
+            public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int pos) {
+                VH h = (VH) holder;
+                Task task = tasks.get(pos);
+                h.tvName.setText(task.getName());
+                h.tvWhen.setText(task.getTaskDateTime());
+                h.itemView.setOnClickListener(v -> openTask(task));
+            }
+
+            @Override
+            public int getItemCount() {
+                return tasks.size();
+            }
+        });
+    }
+
+    private static final int DIALOG_MIN_TASKS = 5; // this many (or more) tasks on a day -> pick from list first
+
+    private void openDayDialog(String date) {
+        DayTasksDialog.show(this, date, () -> render());
+    }
+
+    /**
+     * 1..4 tasks that day -> straight to preview; 5+ -> day list dialog first.
+     */
+    private void openTask(Task task) {
+        String date = task.getTaskDateTime().substring(0, 10);
+        if (taskDao.findByDate(date).size() >= DIALOG_MIN_TASKS) {
+            openDayDialog(date);
+            return;
+        }
+        Intent i = new Intent(this, TaskPreviewActivity.class);
+        i.putExtra(AddTaskActivity.EXTRA_TASK_ID, task.getId());
+        startActivity(i);
+    }
+}

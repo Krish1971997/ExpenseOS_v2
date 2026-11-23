@@ -1,0 +1,728 @@
+package com.expenseos.ui.home;
+
+import android.app.DatePickerDialog;
+import android.app.Dialog;
+import android.content.Context;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.ArrayAdapter;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.RadioGroup;
+import android.widget.Spinner;
+import android.widget.TextView;
+
+import com.expenseos.R;
+import com.expenseos.dao.CashBookDao;
+import com.expenseos.dao.CategoryDao;
+import com.expenseos.dao.PaymentTypeDao;
+import com.expenseos.dao.SubCategoryDao;
+import com.expenseos.model.CashBook;
+import com.expenseos.model.Category;
+import com.expenseos.model.PaymentType;
+import com.expenseos.model.SubCategory;
+import com.expenseos.model.TransactionFilter;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public class TransactionFilterDialog extends Dialog {
+
+    public interface OnApply {
+        void onApply(TransactionFilter filter);
+    }
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
+    private final Integer bookId;
+    private final TransactionFilter filter;
+    private final OnApply onApply;
+    private final int initialTab;
+    private final boolean singleFieldMode;
+
+    private TextView tabCashBook, tabDate, tabCategory, tabSubCategory, tabAmount, tabPaymentType, tabAttachment;
+    private View panelCashBook, panelDate, panelCategory, panelSubCategory, panelAmount, panelPaymentType, panelAttachment;
+    private RadioGroup rgAttachment;
+    private LinearLayout cashBookContainer, categoryContainer, subCategoryContainer, paymentTypeContainer;
+
+    private RadioGroup rgDatePreset;
+    private LinearLayout layoutSingleDay, layoutDateRange;
+    private EditText etSingleDay, etDateFrom, etDateTo;
+
+    private final List<CheckBox> cashBookChecks = new ArrayList<>();
+    private List<CashBook> allCashBooks = new ArrayList<>();
+
+    private final List<CheckBox> categoryChecks = new ArrayList<>();
+    private final List<CheckBox> subCategoryChecks = new ArrayList<>();
+    private final List<CheckBox> paymentTypeChecks = new ArrayList<>();
+    private List<Category> allCategories = new ArrayList<>();
+    private List<SubCategory> allSubCategories = new ArrayList<>();
+    private List<PaymentType> allPaymentTypes = new ArrayList<>();
+
+    // Income / Expense grouping for the Category and Sub Category panels
+    private final List<Category> incomeCategories = new ArrayList<>();
+    private final List<Category> expenseCategories = new ArrayList<>();
+    private final List<Opt> incomeSubs = new ArrayList<>();
+    private final List<Opt> expenseSubs = new ArrayList<>();
+    private int currentTab = -1;
+
+    private record Opt(int id, String label) {
+    }
+
+    private static class Group {
+        final CheckBox header;
+        final List<CheckBox> items = new ArrayList<>();
+
+        Group(CheckBox header) {
+            this.header = header;
+        }
+    }
+
+    // NEW — "Select All" checkboxes for multi-select panels
+    private CheckBox cbSelectAllCategory, cbSelectAllSubCategory, cbSelectAllPaymentType;
+
+    private Spinner spAmountOp1, spAmountOp2;
+    private EditText etAmount1, etAmount2;
+
+    public TransactionFilterDialog(Context ctx, Integer bookId, TransactionFilter currentFilter, OnApply onApply) {
+        this(ctx, bookId, currentFilter, 0, false, onApply);
+    }
+
+    public TransactionFilterDialog(Context ctx, Integer bookId, TransactionFilter currentFilter, int tab, OnApply onApply) {
+        this(ctx, bookId, currentFilter, tab, false, onApply);
+    }
+
+    public TransactionFilterDialog(Context ctx, Integer bookId, TransactionFilter currentFilter, int tab, boolean singleFieldMode, OnApply onApply) {
+        super(ctx);
+        this.bookId = bookId;
+        this.filter = copyOf(currentFilter);
+        this.onApply = onApply;
+        this.initialTab = tab;
+        this.singleFieldMode = singleFieldMode;
+    }
+
+    private static TransactionFilter copyOf(TransactionFilter f) {
+        TransactionFilter c = new TransactionFilter();
+        if (f == null) return c;
+        c.setType(f.getType());
+        c.setBookId(f.getBookId());
+        c.setDateFrom(f.getDateFrom());
+        c.setDateTo(f.getDateTo());
+        c.setCategoryIds(f.getCategoryIds() != null ? new ArrayList<>(f.getCategoryIds()) : null);
+        c.setSubCategoryIds(f.getSubCategoryIds() != null ? new ArrayList<>(f.getSubCategoryIds()) : null);
+        c.setAmountOp1(f.getAmountOp1());
+        c.setAmount1(f.getAmount1());
+        c.setAmountOp2(f.getAmountOp2());
+        c.setAmount2(f.getAmount2());
+        c.setNoteSearch(f.getNoteSearch());
+        c.setPaymentTypes(f.getPaymentTypes() != null ? new ArrayList<>(f.getPaymentTypes()) : null);
+
+        // 🟢 ADD THIS LINE:
+        c.setHasAttachment(f.getHasAttachment());
+
+        c.setPage(f.getPage());
+        c.setPageSize(f.getPageSize());
+        c.setSortBy(f.getSortBy());
+        c.setSortDir(f.getSortDir());
+        return c;
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.dialog_transaction_filter);
+        if (getWindow() != null) {
+            getWindow().setLayout(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    (int) (getContext().getResources().getDisplayMetrics().heightPixels * 0.85));
+        }
+
+        bindViews();
+        applySingleBookVisibility();
+        loadCategoriesAndSubCategories();
+        wireTabs();
+        wireDatePanel();
+        wireAmountPanel();
+        prefillFromFilter();
+
+        // live badges on the tab list
+        watch(etAmount1);
+        watch(etSingleDay);
+        watch(etDateFrom);
+        watch(etDateTo);
+        rgAttachment.setOnCheckedChangeListener((g, id) -> refreshTabs());
+        refreshTabs();
+
+        if (singleFieldMode) {
+            findViewById(R.id.tabListContainer).setVisibility(View.GONE);
+            findViewById(R.id.dividerTabs).setVisibility(View.GONE);
+            String[] titles = {"Cash Book", "Date", "Category", "Sub Category", "Amount", "Payment Type", "Attachment"};
+            if (initialTab >= 0 && initialTab < titles.length) {
+                ((TextView) findViewById(R.id.dialogTitle)).setText(titles[initialTab]);
+            }
+        }
+
+        findViewById(R.id.btnFilterClose).setOnClickListener(v -> dismiss());
+        findViewById(R.id.btnClearAll).setOnClickListener(v -> {
+            TransactionFilter cleared = new TransactionFilter();
+            cleared.setBookId(bookId);
+            if (onApply != null) onApply.onApply(cleared);
+            dismiss();
+        });
+        findViewById(R.id.btnApplyFilter).setOnClickListener(v -> {
+            applyCashBookSelection();
+            applyDateSelection();
+            applyCategorySelection();
+            applyPaymentTypeSelection();
+            applyAmountSelection();
+            applyAttachmentSelection();
+            filter.setBookId(bookId);
+            if (onApply != null) onApply.onApply(filter);
+            dismiss();
+        });
+    }
+
+    private void applyAttachmentSelection() {
+        int checkedId = rgAttachment.getCheckedRadioButtonId();
+        if (checkedId == R.id.rbAttachmentYes) filter.setHasAttachment(true);
+        else if (checkedId == R.id.rbAttachmentNo) filter.setHasAttachment(false);
+        else filter.setHasAttachment(null);
+    }
+
+    private void bindViews() {
+        tabCashBook = findViewById(R.id.tabCashBook);
+        tabDate = findViewById(R.id.tabDate);
+        tabCategory = findViewById(R.id.tabCategory);
+        tabSubCategory = findViewById(R.id.tabSubCategory);
+        tabAmount = findViewById(R.id.tabAmount);
+        tabPaymentType = findViewById(R.id.tabPaymentType);
+
+        panelCashBook = findViewById(R.id.panelCashBook);
+        panelDate = findViewById(R.id.panelDate);
+        panelCategory = findViewById(R.id.panelCategory);
+        panelSubCategory = findViewById(R.id.panelSubCategory);
+        panelAmount = findViewById(R.id.panelAmount);
+        panelPaymentType = findViewById(R.id.panelPaymentType);
+        panelAttachment = findViewById(R.id.panelAttachment);
+
+        cashBookContainer = findViewById(R.id.cashBookContainer);
+        categoryContainer = findViewById(R.id.categoryContainer);
+        subCategoryContainer = findViewById(R.id.subCategoryContainer);
+        paymentTypeContainer = findViewById(R.id.paymentTypeContainer);
+
+        rgDatePreset = findViewById(R.id.rgDatePreset);
+        layoutSingleDay = findViewById(R.id.layoutSingleDay);
+        layoutDateRange = findViewById(R.id.layoutDateRange);
+        etSingleDay = findViewById(R.id.etSingleDay);
+        etDateFrom = findViewById(R.id.etDateFrom);
+        etDateTo = findViewById(R.id.etDateTo);
+
+        spAmountOp1 = findViewById(R.id.spAmountOp1);
+        spAmountOp2 = findViewById(R.id.spAmountOp2);
+        etAmount1 = findViewById(R.id.etAmount1);
+        etAmount2 = findViewById(R.id.etAmount2);
+
+        cbSelectAllCategory = findViewById(R.id.cbSelectAllCategory);
+        cbSelectAllSubCategory = findViewById(R.id.cbSelectAllSubCategory);
+        cbSelectAllPaymentType = findViewById(R.id.cbSelectAllPaymentType);
+
+        tabAttachment = findViewById(R.id.tabAttachment);
+        rgAttachment = findViewById(R.id.rgAttachment);
+    }
+
+    // NEW — Cash Book only makes sense when this dialog is filtering across
+    // multiple books (All Transactions screen, bookId == null). Inside a
+    // single cashbook (Home screen, bookId is a real id) every row already
+    // belongs to that one book, so the tab is redundant — hide it there.
+    private boolean isSingleBookContext() {
+        return bookId != null && bookId > 0;
+    }
+
+    private void applySingleBookVisibility() {
+        if (!isSingleBookContext()) return;
+        tabCashBook.setVisibility(View.GONE);
+        panelCashBook.setVisibility(View.GONE);
+    }
+
+    // ── Tabs (Index Order Fixed) ─────────────────────────────
+// NEW — guard against a caller accidentally opening tab 0 (Cash Book) in
+// single-book context; land on Date instead rather than showing a blank panel.
+    private void wireTabs() {
+        tabCashBook.setOnClickListener(v -> selectTab(0));
+        tabDate.setOnClickListener(v -> selectTab(1));
+        tabCategory.setOnClickListener(v -> selectTab(2));
+        tabSubCategory.setOnClickListener(v -> selectTab(3));
+        tabAmount.setOnClickListener(v -> selectTab(4));
+        tabPaymentType.setOnClickListener(v -> selectTab(5));
+        tabAttachment.setOnClickListener(v -> selectTab(6));
+        selectTab(isSingleBookContext() && initialTab == 0 ? 1 : initialTab);
+    }
+
+    private static final String[] TAB_TITLES =
+            {"Cash Book", "Date", "Category", "Sub Category", "Amount", "Payment Type", "Attachment"};
+
+    private void selectTab(int index) {
+        currentTab = index;
+        refreshTabs();
+    }
+
+    // Tab with an active selection shows "(n)" or a dot and stays blue + bold, even when it is not the open tab
+    private void refreshTabs() {
+        TextView[] tabs = {tabCashBook, tabDate, tabCategory, tabSubCategory, tabAmount, tabPaymentType, tabAttachment};
+        View[] panels = {panelCashBook, panelDate, panelCategory, panelSubCategory, panelAmount, panelPaymentType, panelAttachment};
+
+        int selColor = getContext().getResources().getColor(R.color.primary);
+        int normColor = getContext().getResources().getColor(R.color.text);
+
+        int[] n = new int[7];
+        n[0] = countChecked(cashBookChecks);
+        n[1] = isDateActive() ? 1 : 0;
+        n[2] = countChecked(categoryChecks);
+        n[3] = countChecked(subCategoryChecks);
+        n[4] = etAmount1.getText().toString().trim().isEmpty() ? 0 : 1;
+        n[5] = countChecked(paymentTypeChecks);
+        int att = rgAttachment.getCheckedRadioButtonId();
+        n[6] = (att == R.id.rbAttachmentYes || att == R.id.rbAttachmentNo) ? 1 : 0;
+        boolean[] showCount = {true, false, true, true, false, true, false};
+
+        for (int i = 0; i < tabs.length; i++) {
+            if (tabs[i] == null || panels[i] == null) continue;
+            boolean sel = (i == currentTab);
+            boolean active = n[i] > 0;
+            String label = TAB_TITLES[i];
+            if (active) label += showCount[i] ? " (" + n[i] + ")" : " \u25CF";
+            tabs[i].setText(label);
+            tabs[i].setTextColor(sel || active ? selColor : normColor);
+            tabs[i].setBackgroundColor(sel ? 0xFFE8F0FE : 0x00000000);
+            tabs[i].setTypeface(null, sel || active ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
+            panels[i].setVisibility(sel ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private boolean isDateActive() {
+        int id = rgDatePreset.getCheckedRadioButtonId();
+        if (id == R.id.rbSingleDay) return !etSingleDay.getText().toString().trim().isEmpty();
+        if (id == R.id.rbDateRange)
+            return !etDateFrom.getText().toString().trim().isEmpty()
+                    || !etDateTo.getText().toString().trim().isEmpty();
+        return id == R.id.rbToday || id == R.id.rbYesterday || id == R.id.rbThisMonth || id == R.id.rbLastMonth;
+    }
+
+    private static int countChecked(List<CheckBox> l) {
+        int n = 0;
+        for (CheckBox cb : l) if (cb.isChecked()) n++;
+        return n;
+    }
+
+    private static boolean areAllChecked(List<CheckBox> l) {
+        if (l.isEmpty()) return false;
+        for (CheckBox cb : l) if (!cb.isChecked()) return false;
+        return true;
+    }
+
+    private void watch(EditText e) {
+        e.addTextChangedListener(new android.text.TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int a, int b, int c) {
+            }
+
+            @Override
+            public void afterTextChanged(android.text.Editable s) {
+                refreshTabs();
+            }
+        });
+    }
+
+    // ── Date panel ──────────────────────────────────────────
+    private void wireDatePanel() {
+        rgDatePreset.setOnCheckedChangeListener((group, checkedId) -> {
+            layoutSingleDay.setVisibility(checkedId == R.id.rbSingleDay ? View.VISIBLE : View.GONE);
+            layoutDateRange.setVisibility(checkedId == R.id.rbDateRange ? View.VISIBLE : View.GONE);
+            refreshTabs();
+        });
+
+        etSingleDay.setOnClickListener(v -> pickDate(etSingleDay));
+        etDateFrom.setOnClickListener(v -> pickDate(etDateFrom));
+        etDateTo.setOnClickListener(v -> pickDate(etDateTo));
+    }
+
+    private void pickDate(EditText target) {
+        LocalDate now = LocalDate.now();
+        new DatePickerDialog(getContext(), (view, year, month, day) -> {
+            LocalDate picked = LocalDate.of(year, month + 1, day);
+            target.setText(picked.format(DATE_FMT));
+        }, now.getYear(), now.getMonthValue() - 1, now.getDayOfMonth()).show();
+    }
+
+    private void applyDateSelection() {
+        int checkedId = rgDatePreset.getCheckedRadioButtonId();
+        LocalDate today = LocalDate.now();
+
+        if (checkedId == R.id.rbToday) {
+            filter.setDateFrom(today);
+            filter.setDateTo(today);
+        } else if (checkedId == R.id.rbYesterday) {
+            LocalDate y = today.minusDays(1);
+            filter.setDateFrom(y);
+            filter.setDateTo(y);
+        } else if (checkedId == R.id.rbThisMonth) {
+            YearMonth ym = YearMonth.from(today);
+            filter.setDateFrom(ym.atDay(1));
+            filter.setDateTo(ym.atEndOfMonth());
+        } else if (checkedId == R.id.rbLastMonth) {
+            YearMonth ym = YearMonth.from(today).minusMonths(1);
+            filter.setDateFrom(ym.atDay(1));
+            filter.setDateTo(ym.atEndOfMonth());
+        } else if (checkedId == R.id.rbSingleDay) {
+            LocalDate d = parseOrNull(etSingleDay.getText().toString().trim());
+            filter.setDateFrom(d);
+            filter.setDateTo(d);
+        } else if (checkedId == R.id.rbDateRange) {
+            filter.setDateFrom(parseOrNull(etDateFrom.getText().toString().trim()));
+            filter.setDateTo(parseOrNull(etDateTo.getText().toString().trim()));
+        } else {
+            filter.setDateFrom(null);
+            filter.setDateTo(null);
+        }
+    }
+
+    private LocalDate parseOrNull(String s) {
+        if (s == null || s.isEmpty()) return null;
+        try {
+            return LocalDate.parse(s, DATE_FMT);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // ── Load Data ───────────────────────────────────────────
+    private void loadCategoriesAndSubCategories() {
+        CategoryDao categoryDao = new CategoryDao(getContext());
+        Map<Integer, Category> merged = new LinkedHashMap<>();
+        incomeCategories.clear();
+        expenseCategories.clear();
+
+        if (bookId != null && bookId > 0) {
+            incomeCategories.addAll(categoryDao.findByType("INCOME", bookId));
+            expenseCategories.addAll(categoryDao.findByType("EXPENSE", bookId));
+        } else {
+            incomeCategories.addAll(categoryDao.findAllByType("INCOME"));
+            expenseCategories.addAll(categoryDao.findAllByType("EXPENSE"));
+        }
+        for (Category c : incomeCategories) merged.put(c.getId(), c);
+        for (Category c : expenseCategories) merged.put(c.getId(), c);
+        allCategories = new ArrayList<>(merged.values());
+
+        SubCategoryDao subCategoryDao = new SubCategoryDao(getContext());
+        allSubCategories = subCategoryDao.findAll();
+        // Sub categories follow their category's type; "(Category)" keeps duplicate names like "Other" clear
+        incomeSubs.clear();
+        expenseSubs.clear();
+        for (Category c : incomeCategories)
+            for (SubCategory s : subCategoryDao.findByCategoryId(c.getId()))
+                incomeSubs.add(new Opt(s.getId(), s.getName() + " (" + c.getName() + ")"));
+        for (Category c : expenseCategories)
+            for (SubCategory s : subCategoryDao.findByCategoryId(c.getId()))
+                expenseSubs.add(new Opt(s.getId(), s.getName() + " (" + c.getName() + ")"));
+
+        buildCategoryCheckboxes();
+        buildSubCategoryCheckboxes();
+
+// NEW — skip the Cash Book query entirely in single-book context; the
+// panel's hidden anyway, no need to hit CashBookDao or build checkboxes.
+        allPaymentTypes = new PaymentTypeDao(getContext()).findAll();
+        buildPaymentTypeCheckboxes();
+
+        if (!isSingleBookContext()) {
+            CashBookDao cashBookDao = new CashBookDao(getContext());
+            allCashBooks = cashBookDao.findAll();
+            buildCashBookCheckboxes();
+        }
+    }
+
+    private void buildCashBookCheckboxes() {
+        cashBookContainer.removeAllViews();
+        cashBookChecks.clear();
+        List<Integer> selected = filter.getBookIds();
+
+        for (CashBook cbBook : allCashBooks) {
+            CheckBox cb = new CheckBox(getContext());
+            cb.setText(cbBook.getName());
+            cb.setTag(cbBook.getId());
+            cb.setPadding(0, 12, 0, 12);
+            if (selected != null && selected.contains(cbBook.getId())) {
+                cb.setChecked(true);
+            }
+            cb.setOnCheckedChangeListener((b, c) -> refreshTabs());
+            cashBookContainer.addView(cb);
+            cashBookChecks.add(cb);
+        }
+    }
+
+    private void buildCategoryCheckboxes() {
+        List<Opt> inc = new ArrayList<>();
+        for (Category c : incomeCategories) inc.add(new Opt(c.getId(), c.getName()));
+        List<Opt> exp = new ArrayList<>();
+        for (Category c : expenseCategories) exp.add(new Opt(c.getId(), c.getName()));
+        buildGroupedPanel(categoryContainer, cbSelectAllCategory, categoryChecks,
+                filter.getCategoryIds(), inc, exp, "No categories found for this book.");
+    }
+
+    private void buildSubCategoryCheckboxes() {
+        buildGroupedPanel(subCategoryContainer, cbSelectAllSubCategory, subCategoryChecks,
+                filter.getSubCategoryIds(), incomeSubs, expenseSubs, "No sub categories found.");
+    }
+
+    // Income / Expense sections. Each header checkbox selects its whole group,
+    // the top "Select All" selects both, and every change refreshes the tab badges.
+    private void buildGroupedPanel(LinearLayout container, CheckBox selectAllAll, List<CheckBox> allChecks,
+                                   List<Integer> selected, List<Opt> income, List<Opt> expense, String emptyText) {
+        container.removeAllViews();
+        allChecks.clear();
+        final List<Group> groups = new ArrayList<>();
+        addGroup(container, "Income", income, selected, allChecks, groups);
+        addGroup(container, "Expense", expense, selected, allChecks, groups);
+
+        if (allChecks.isEmpty()) {
+            TextView empty = new TextView(getContext());
+            empty.setText(emptyText);
+            empty.setTextColor(getContext().getResources().getColor(R.color.text_muted));
+            container.addView(empty);
+            if (selectAllAll != null) selectAllAll.setVisibility(View.GONE);
+            return;
+        }
+
+        final Runnable sync = () -> {
+            for (Group g : groups) g.header.setChecked(areAllChecked(g.items));
+            if (selectAllAll != null) selectAllAll.setChecked(areAllChecked(allChecks));
+            refreshTabs();
+        };
+
+        for (Group g : groups) {
+            g.header.setOnClickListener(v -> {
+                boolean c = g.header.isChecked();
+                for (CheckBox cb : g.items) cb.setChecked(c);
+            });
+        }
+        if (selectAllAll != null) {
+            selectAllAll.setVisibility(View.VISIBLE);
+            selectAllAll.setOnClickListener(v -> {
+                boolean c = selectAllAll.isChecked();
+                for (CheckBox cb : allChecks) cb.setChecked(c);
+            });
+        }
+        for (CheckBox cb : allChecks) cb.setOnCheckedChangeListener((b, c) -> sync.run());
+        sync.run();
+    }
+
+    private void addGroup(LinearLayout container, String title, List<Opt> opts, List<Integer> selected,
+                          List<CheckBox> allChecks, List<Group> groups) {
+        if (opts.isEmpty()) return;
+
+        CheckBox header = new CheckBox(getContext());
+        header.setText(title);
+        header.setTypeface(null, android.graphics.Typeface.BOLD);
+        header.setTextColor(getContext().getResources().getColor(R.color.primary));
+        header.setPadding(0, 16, 0, 12);
+        container.addView(header);
+
+        Group g = new Group(header);
+        int indent = (int) (24 * getContext().getResources().getDisplayMetrics().density);
+        for (Opt o : opts) {
+            CheckBox cb = new CheckBox(getContext());
+            cb.setText(o.label);
+            cb.setTag(o.id);
+            cb.setPadding(0, 12, 0, 12);
+            if (selected != null && selected.contains(o.id)) cb.setChecked(true);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.setMarginStart(indent);
+            container.addView(cb, lp);
+            g.items.add(cb);
+            allChecks.add(cb);
+        }
+        groups.add(g);
+    }
+
+    private void buildPaymentTypeCheckboxes() {
+        paymentTypeContainer.removeAllViews();
+        paymentTypeChecks.clear();
+        List<String> selected = filter.getPaymentTypes();
+        for (PaymentType pt : allPaymentTypes) {
+            CheckBox cb = new CheckBox(getContext());
+            cb.setText(pt.getName());
+            cb.setTag(pt.getName());
+            cb.setPadding(0, 12, 0, 12);
+            if (selected != null && selected.contains(pt.getName())) cb.setChecked(true);
+            paymentTypeContainer.addView(cb);
+            paymentTypeChecks.add(cb);
+        }
+        if (allPaymentTypes.isEmpty()) {
+            TextView empty = new TextView(getContext());
+            empty.setText("No payment types found.");
+            empty.setTextColor(getContext().getResources().getColor(R.color.text_muted));
+            paymentTypeContainer.addView(empty);
+        }
+        setupSelectAll(cbSelectAllPaymentType, paymentTypeChecks);
+    }
+
+    // NEW — wires a "Select All" checkbox to a list of item checkboxes:
+    // tapping it checks/unchecks every item, and toggling any single item
+    // keeps the "Select All" state (checked/unchecked) in sync.
+    private void setupSelectAll(CheckBox selectAllCb, List<CheckBox> itemChecks) {
+        if (selectAllCb == null) return;
+
+        if (itemChecks.isEmpty()) {
+            selectAllCb.setVisibility(View.GONE);
+            return;
+        }
+        selectAllCb.setVisibility(View.VISIBLE);
+
+        selectAllCb.setOnClickListener(v -> {
+            boolean checked = selectAllCb.isChecked();
+            for (CheckBox cb : itemChecks) cb.setChecked(checked);
+        });
+
+        for (CheckBox cb : itemChecks) {
+            cb.setOnCheckedChangeListener((buttonView, isChecked) ->
+                    updateSelectAllState(selectAllCb, itemChecks));
+        }
+
+        updateSelectAllState(selectAllCb, itemChecks);
+    }
+
+    private void updateSelectAllState(CheckBox selectAllCb, List<CheckBox> itemChecks) {
+        if (selectAllCb == null) return;
+        boolean allChecked = true;
+        for (CheckBox cb : itemChecks) {
+            if (!cb.isChecked()) {
+                allChecked = false;
+                break;
+            }
+        }
+        selectAllCb.setChecked(allChecked);
+        refreshTabs();
+    }
+
+    private void applyCashBookSelection() {
+        List<Integer> selectedBookIds = new ArrayList<>();
+        for (CheckBox cb : cashBookChecks) {
+            if (cb.isChecked()) {
+                selectedBookIds.add((Integer) cb.getTag());
+            }
+        }
+        filter.setBookIds(selectedBookIds.isEmpty() ? null : selectedBookIds);
+    }
+
+    private void applyPaymentTypeSelection() {
+        List<String> selected = new ArrayList<>();
+        for (CheckBox cb : paymentTypeChecks)
+            if (cb.isChecked()) selected.add((String) cb.getTag());
+        filter.setPaymentTypes(selected.isEmpty() ? null : selected);
+    }
+
+    private void applyCategorySelection() {
+        List<Integer> catIds = new ArrayList<>();
+        for (CheckBox cb : categoryChecks)
+            if (cb.isChecked()) catIds.add((Integer) cb.getTag());
+        filter.setCategoryIds(catIds.isEmpty() ? null : catIds);
+
+        List<Integer> subIds = new ArrayList<>();
+        for (CheckBox cb : subCategoryChecks)
+            if (cb.isChecked()) subIds.add((Integer) cb.getTag());
+        filter.setSubCategoryIds(subIds.isEmpty() ? null : subIds);
+    }
+
+    // ── Amount panel ────────────────────────────────────────
+    private void wireAmountPanel() {
+        String[] ops1 = {"=", ">", ">=", "<", "<="};
+        ArrayAdapter<String> op1Adapter = new ArrayAdapter<>(getContext(), android.R.layout.simple_spinner_item, ops1);
+        op1Adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spAmountOp1.setAdapter(op1Adapter);
+
+        String[] ops2 = {"(none)", ">=", "<=", ">", "<", "="};
+        ArrayAdapter<String> op2Adapter = new ArrayAdapter<>(getContext(), android.R.layout.simple_spinner_item, ops2);
+        op2Adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spAmountOp2.setAdapter(op2Adapter);
+
+        spAmountOp2.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                etAmount2.setEnabled(position != 0);
+                if (position == 0) etAmount2.setText("");
+            }
+
+            @Override
+            public void onNothingSelected(android.widget.AdapterView<?> parent) {
+            }
+        });
+
+        if (filter.getAmountOp1() != null) {
+            int idx = java.util.Arrays.asList(ops1).indexOf(filter.getAmountOp1());
+            if (idx >= 0) spAmountOp1.setSelection(idx);
+        }
+        if (filter.getAmount1() != null) etAmount1.setText(filter.getAmount1().toPlainString());
+        if (filter.getAmountOp2() != null) {
+            int idx = java.util.Arrays.asList(ops2).indexOf(filter.getAmountOp2());
+            if (idx >= 0) spAmountOp2.setSelection(idx);
+        }
+        if (filter.getAmount2() != null) etAmount2.setText(filter.getAmount2().toPlainString());
+    }
+
+    private void applyAmountSelection() {
+        String amt1Str = etAmount1.getText().toString().trim();
+        if (amt1Str.isEmpty()) {
+            filter.setAmountOp1(null);
+            filter.setAmount1(null);
+        } else {
+            filter.setAmountOp1((String) spAmountOp1.getSelectedItem());
+            filter.setAmount1(new BigDecimal(amt1Str));
+        }
+
+        String op2 = (String) spAmountOp2.getSelectedItem();
+        String amt2Str = etAmount2.getText().toString().trim();
+        if ("(none)".equals(op2) || amt2Str.isEmpty()) {
+            filter.setAmountOp2(null);
+            filter.setAmount2(null);
+        } else {
+            filter.setAmountOp2(op2);
+            filter.setAmount2(new BigDecimal(amt2Str));
+        }
+    }
+
+    private void prefillFromFilter() {
+        if (filter.getDateFrom() != null && filter.getDateFrom().equals(filter.getDateTo())) {
+            if (filter.getDateFrom().equals(LocalDate.now())) {
+                rgDatePreset.check(R.id.rbToday);
+            } else if (filter.getDateFrom().equals(LocalDate.now().minusDays(1))) {
+                rgDatePreset.check(R.id.rbYesterday);
+            } else {
+                rgDatePreset.check(R.id.rbSingleDay);
+                etSingleDay.setText(filter.getDateFrom().format(DATE_FMT));
+            }
+        } else if (filter.getDateFrom() != null || filter.getDateTo() != null) {
+            rgDatePreset.check(R.id.rbDateRange);
+            if (filter.getDateFrom() != null)
+                etDateFrom.setText(filter.getDateFrom().format(DATE_FMT));
+            if (filter.getDateTo() != null) etDateTo.setText(filter.getDateTo().format(DATE_FMT));
+        } else {
+            rgDatePreset.check(R.id.rbAllTime);
+        }
+        if (Boolean.TRUE.equals(filter.getHasAttachment()))
+            rgAttachment.check(R.id.rbAttachmentYes);
+        else if (Boolean.FALSE.equals(filter.getHasAttachment()))
+            rgAttachment.check(R.id.rbAttachmentNo);
+        else rgAttachment.check(R.id.rbAttachmentAll);
+    }
+}

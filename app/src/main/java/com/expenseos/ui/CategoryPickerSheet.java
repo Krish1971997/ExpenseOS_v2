@@ -1,0 +1,188 @@
+package com.expenseos.ui;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.graphics.Typeface;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+import com.expenseos.R;
+import com.expenseos.dao.SubCategoryDao;
+import com.expenseos.model.Category;
+import com.expenseos.model.SubCategory;
+import com.google.android.material.bottomsheet.BottomSheetDialog;
+
+import java.util.List;
+
+/**
+ * Two-pane category/sub-category picker — left column lists categories
+ * (chevron = has sub-categories), right column shows the highlighted
+ * category's sub-categories, updating live as you tap the left side.
+ * Categories with no sub-categories select immediately on tap.
+ * <p>
+ * Replaces the old Spinner pair: a BottomSheetDialog isn't anchored near
+ * the keyboard, so the list is never pushed off-screen or hidden behind it.
+ */
+public class CategoryPickerSheet {
+
+    public interface OnPicked {
+        void onPicked(Category category, SubCategory subCategory); // subCategory null = none
+    }
+
+    public static void show(Activity activity, List<Category> categories, SubCategoryDao subCatDao,
+                            Integer preselectCategoryId, int bookId, OnPicked callback) {
+        BottomSheetDialog sheet = new BottomSheetDialog(activity);
+        LinearLayout root = new LinearLayout(activity);
+        root.setOrientation(LinearLayout.VERTICAL);
+        // Glass design: frosted-light sheet surface + real backdrop blur (API 31+).
+        root.setBackgroundResource(R.drawable.bg_glass_sheet_light);
+        com.expenseos.ui.glass.GlassUi.applyRealBlur(sheet.getWindow(), root);
+
+        // Header — app's primary blue instead of black, + a ✎ edit icon
+        // that jumps to Settings > Categories for this book.
+        LinearLayout header = new LinearLayout(activity);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setBackgroundColor(activity.getColor(R.color.primary));
+        header.setPadding(dp(activity, 20), dp(activity, 16), dp(activity, 16), dp(activity, 16));
+
+        TextView title = new TextView(activity);
+        title.setText("Category");
+        title.setTextColor(androidx.core.content.ContextCompat.getColor(activity, R.color.on_primary));
+        title.setTextSize(18);
+        title.setTypeface(null, Typeface.BOLD);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        header.addView(title);
+
+        TextView edit = new TextView(activity);
+        edit.setText("✎");
+        edit.setTextColor(androidx.core.content.ContextCompat.getColor(activity, R.color.on_primary));
+        edit.setTextSize(18);
+        edit.setPadding(dp(activity, 12), 0, dp(activity, 12), 0);
+        edit.setOnClickListener(v -> {
+            sheet.dismiss();
+            Intent i = new Intent(activity, SettingsActivity.class);
+            i.putExtra("bookScoped", true);
+            i.putExtra("bookId", bookId);
+            i.putExtra("startTab", 0); // Categories tab
+            activity.startActivity(i);
+        });
+        header.addView(edit);
+
+        TextView close = new TextView(activity);
+        close.setText("✕");
+        close.setTextColor(androidx.core.content.ContextCompat.getColor(activity, R.color.on_primary));
+        close.setTextSize(20);
+        close.setPadding(dp(activity, 16), 0, 0, 0);
+        close.setOnClickListener(v -> sheet.dismiss());
+        header.addView(close);
+        root.addView(header);
+
+        // Two-column body
+        LinearLayout body = new LinearLayout(activity);
+        body.setOrientation(LinearLayout.HORIZONTAL);
+        body.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(activity, 460)));
+
+        ScrollView leftScroll = new ScrollView(activity);
+        LinearLayout leftList = new LinearLayout(activity);
+        leftList.setOrientation(LinearLayout.VERTICAL);
+        leftScroll.addView(leftList);
+        leftScroll.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.42f));
+
+        ScrollView rightScroll = new ScrollView(activity);
+        LinearLayout rightList = new LinearLayout(activity);
+        rightList.setOrientation(LinearLayout.VERTICAL);
+        rightScroll.setBackgroundColor(androidx.core.content.ContextCompat.getColor(activity, R.color.surface_sunken));
+        rightScroll.addView(rightList);
+        rightScroll.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.58f));
+
+        body.addView(leftScroll);
+        body.addView(rightScroll);
+        root.addView(body);
+        sheet.setContentView(root);
+
+        View[] highlighted = new View[1];
+
+        for (Category c : categories) {
+            List<SubCategory> subs = subCatDao.findByCategoryId(c.getId());
+            boolean hasSubs = !subs.isEmpty();
+            boolean preselected = preselectCategoryId != null && c.getId() == preselectCategoryId;
+
+            LinearLayout row = leftRow(activity, c.getName(), hasSubs, preselected);
+            if (preselected) highlighted[0] = row;
+            row.setOnClickListener(v -> {
+                if (highlighted[0] != null) highlighted[0].setBackgroundColor(0x00000000);
+                row.setBackgroundColor(androidx.core.content.ContextCompat.getColor(activity, R.color.cell_highlight));
+                highlighted[0] = row;
+
+                if (hasSubs) {
+                    populateRight(activity, rightList, c, subs, sheet, callback);
+                } else {
+                    rightList.removeAllViews();
+                    callback.onPicked(c, null);
+                    sheet.dismiss();
+                }
+            });
+            leftList.addView(row);
+
+            if (preselected && hasSubs)
+                populateRight(activity, rightList, c, subs, sheet, callback);
+        }
+
+        sheet.show();
+    }
+
+    private static LinearLayout leftRow(Activity activity, String name, boolean hasSubs, boolean selected) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(activity, 16), dp(activity, 14), dp(activity, 8), dp(activity, 14));
+        row.setClickable(true);
+        row.setFocusable(true);
+        if (selected) row.setBackgroundColor(androidx.core.content.ContextCompat.getColor(activity, R.color.cell_highlight));
+
+        TextView label = new TextView(activity);
+        label.setText(name);
+        label.setTextSize(15);
+        label.setTextColor(selected ? 0xFFD84315 : 0xFF212121);
+        label.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(label);
+
+        if (hasSubs) {
+            TextView chevron = new TextView(activity);
+            chevron.setText("›");
+            chevron.setTextSize(18);
+            chevron.setTextColor(androidx.core.content.ContextCompat.getColor(activity, R.color.text_hint));
+            row.addView(chevron);
+        }
+        return row;
+    }
+
+    private static void populateRight(Activity activity, LinearLayout rightList, Category category,
+                                      List<SubCategory> subs, BottomSheetDialog sheet, OnPicked callback) {
+        rightList.removeAllViews();
+        for (SubCategory sc : subs) {
+            TextView row = new TextView(activity);
+            row.setText(sc.getName());
+            row.setTextSize(15);
+            row.setTextColor(androidx.core.content.ContextCompat.getColor(activity, R.color.text));
+            row.setPadding(dp(activity, 16), dp(activity, 14), dp(activity, 16), dp(activity, 14));
+            row.setClickable(true);
+            row.setFocusable(true);
+            row.setOnClickListener(v -> {
+                callback.onPicked(category, sc);
+                sheet.dismiss();
+            });
+            rightList.addView(row);
+        }
+    }
+
+    private static int dp(Activity a, int v) {
+        return (int) (v * a.getResources().getDisplayMetrics().density);
+    }
+}

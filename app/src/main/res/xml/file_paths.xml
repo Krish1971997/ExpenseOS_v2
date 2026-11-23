@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Matches new File(getCacheDir(), "receipts") in
+         TransactionEntryActivity.launchCamera() -->
+    <cache-path
+        name="receipts"
+        path="receipts/" />
+    <external-path
+        name="external_files"
+        path="." />
+    <cache-path
+        name="cache"
+        path="." />
+    <!-- Matches new File(getCacheDir(), "reports") in
+         GenerateReportActivity.previewPdf() -->
+    <cache-path
+        name="reports"
+        path="reports/" />
+    <!-- Matches new File(getFilesDir(), "ai_attachments") in
+         ChatActivity.handlePickedFile() -->
+    <files-path
+        name="ai_attachments"
+        path="ai_attachments/" />
+</paths>

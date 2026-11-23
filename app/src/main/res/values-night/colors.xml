@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ExpenseOS Premium Design System — DARK palette (same keys) -->
+
+    <color name="primary">#60A5FA</color>
+    <color name="primary_dark">#3B82F6</color>
+    <color name="primary_light">#93C5FD</color>
+    <color name="primary_soft">#16243F</color>
+    <color name="primary_container">#1E3A8A</color>
+    <color name="on_primary">#0B1220</color>
+
+    <color name="secondary">#2DD4BF</color>
+    <color name="secondary_dark">#14B8A6</color>
+    <color name="secondary_soft">#0E2A2A</color>
+    <color name="accent">#A78BFA</color>
+    <color name="accent_soft">#241E42</color>
+
+    <color name="success">#34D399</color>
+    <color name="success_bg">#0E2A22</color>
+    <color name="danger">#FB7185</color>
+    <color name="danger_bg">#3A1220</color>
+    <color name="warning">#FBBF24</color>
+    <color name="warning_bg">#3A2A0C</color>
+    <color name="info">#60A5FA</color>
+    <color name="info_bg">#16243F</color>
+
+    <color name="green">#34D399</color>
+    <color name="green_bg">#0E2A22</color>
+    <color name="red">#F87171</color>
+    <color name="red_bg">#3A1220</color>
+    <color name="amber">#FBBF24</color>
+    <color name="amber_bg">#3A2A0C</color>
+
+    <color name="bg">#0A0F1C</color>
+    <color name="background">#0A0F1C</color>
+    <color name="bg_card">#B816202E</color>
+    <color name="surface">#DE1B2534</color>
+    <color name="surface_2">#2EFFFFFF</color>
+    <color name="surface_3">#40FFFFFF</color>
+    <color name="nav_bg">#B3141C2C</color>
+    <color name="border">#33FFFFFF</color>
+    <color name="divider">#1FFFFFFF</color>
+
+    <color name="text">#E7EDF6</color>
+    <color name="text_primary">#E8EEF7</color>
+    <color name="text_muted">#94A3B8</color>
+    <color name="text_secondary">#94A3B8</color>
+    <color name="text_hint">#64748B</color>
+    <color name="text_inverse">#0B1220</color>
+    <color name="white">#FFFFFF</color>
+
+    <color name="hero_bg">#101C3A</color>
+    <color name="hero_bg_2">#1B3363</color>
+    <color name="hero_text">#FFFFFF</color>
+    <color name="hero_text_muted">#93B4E8</color>
+    <color name="hero_income">#6EE7B7</color>
+    <color name="hero_expense">#FDA4AF</color>
+    <color name="hero_divider">#253A63</color>
+
+    <color name="toast_bg">#E8EEF7</color>
+    <color name="toast_text">#0B1220</color>
+
+    <color name="chart_1">#60A5FA</color>
+    <color name="chart_2">#2DD4BF</color>
+    <color name="chart_3">#A78BFA</color>
+    <color name="chart_4">#FBBF24</color>
+    <color name="chart_5">#FB7185</color>
+    <color name="chart_6">#22D3EE</color>
+    <color name="chart_grid">#1E293B</color>
+    <color name="chart_axis">#64748B</color>
+
+    <color name="income_badge_bg">#0E2A22</color>
+    <color name="income_badge_text">#34D399</color>
+    <color name="expense_badge_bg">#3A1220</color>
+    <color name="expense_badge_text">#FB7185</color>
+
+    <color name="skeleton">#1B2537</color>
+    <color name="skeleton_highlight">#243049</color>
+    <color name="scrim">#99000000</color>
+    <color name="overlay">#99000000</color>
+    <color name="shadow">#33000000</color>
+    <color name="selection">#1E3A8A</color>
+    <color name="ft_row_bg">#131C28</color>
+    <color name="ft_row_weekend_bg">#16202E</color>
+    <color name="ft_cell_filled_bg">#3B2F12</color>
+
+    <!-- ══════════ GLASS DESIGN SYSTEM — deep navy aurora ══════════ -->
+    <color name="glass_fill">#33FFFFFF</color>
+    <color name="glass_fill_strong">#CC16202E</color>
+    <color name="glass_fill_soft">#1FFFFFFF</color>
+    <color name="glass_stroke">#40FFFFFF</color>
+    <color name="glass_stroke_soft">#26FFFFFF</color>
+    <color name="aurora_base">#0A0F1C</color>
+    <color name="aurora_blue">#2E1E3A8A</color>
+    <color name="aurora_violet">#2E4C1D95</color>
+    <color name="aurora_mint">#2E134E4A</color>
+    <color name="aurora_sky">#2E0E7490</color>
+    <color name="hero_grad_start">#CC1E3A8A</color>
+    <color name="hero_grad_end">#CC4C1D95</color>
+
+    <!-- ══════════ SHARED SURFACE / OVERLAY TOKENS (night) ══════════ -->
+    <color name="on_primary_soft">#B30B1220</color>
+    <color name="surface_sunken">#1A2436</color>
+    <color name="cell_highlight">#3A1F2B</color>
+    <color name="aurora_blue_fade">#001E3A8A</color>
+    <color name="aurora_violet_fade">#004C1D95</color>
+    <color name="aurora_mint_fade">#00134E4A</color>
+    <color name="aurora_sky_fade">#000E7490</color>
+    <color name="splash_bg">#0A0F1C</color>
+    <color name="console_bg">#0B0F16</color>
+    <color name="console_text">#D6DEEA</color>
+    <color name="console_success">#66BB6A</color>
+    <color name="console_error">#EF5350</color>
+    <color name="console_warn">#FFCA28</color>
+    <color name="alarm_bg">#101317</color>
+    <color name="alarm_text">#FFFFFF</color>
+    <color name="alarm_text_soft">#C8C8C8</color>
+    <color name="alarm_text_dim">#B0B0B0</color>
+    <color name="alarm_text_faint">#9E9E9E</color>
+    <color name="alarm_stroke">#555555</color>
+    <color name="scrim_soft">#CC000000</color>
+    <color name="code_bg">#12161F</color>
+</resources>

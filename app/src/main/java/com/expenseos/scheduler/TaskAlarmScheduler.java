@@ -1,0 +1,176 @@
+package com.expenseos.scheduler;
+
+import android.app.AlarmManager;
+import android.app.PendingIntent;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.os.Build;
+
+import com.expenseos.dao.EventDao;
+import com.expenseos.dao.ReminderDao;
+import com.expenseos.db.LocalDB;
+import com.expenseos.model.EventReminder;
+import com.expenseos.receiver.AlarmReceiver;
+import com.expenseos.receiver.TaskNotificationReceiver;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+
+/**
+ * Computes each reminder's trigger date from: task_date ± event.offsetDays,
+ * then ± eventReminder.offsetDays, at eventReminder's time — and schedules/
+ * cancels the AlarmManager entries. Called from AddTaskActivity on save,
+ * edit, and delete.
+ */
+public class TaskAlarmScheduler {
+
+    private static final DateTimeFormatter TASK_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+
+    /**
+     * @return how many alarms/notifications were actually scheduled (past times are skipped).
+     */
+    public static synchronized int scheduleForTask(Context ctx, long taskId, String taskDateTimeStr, List<Long> eventIds) {
+        cancelForTask(ctx, taskId); // clear old alarms first (handles edit)
+        int scheduled = 0;
+
+        LocalDateTime taskDateTime = LocalDateTime.parse(taskDateTimeStr, TASK_FMT);
+        EventDao eventDao = new EventDao(ctx);
+
+        for (Long eventId : eventIds) {
+            com.expenseos.model.Event event = findEvent(eventDao, eventId);
+            if (event == null) continue;
+
+            LocalDateTime baseDate = "AFTER".equals(event.getOffsetDirection())
+                    ? taskDateTime.plusDays(event.getOffsetDays())
+                    : taskDateTime.minusDays(event.getOffsetDays());
+
+            scheduled += scheduleType(ctx, taskId, eventDao, eventId, "NOTIFICATION", baseDate);
+            scheduled += scheduleType(ctx, taskId, eventDao, eventId, "ALARM", baseDate);
+        }
+        return scheduled;
+    }
+
+
+    private static PendingIntent buildPendingIntent(Context ctx, int requestCode, long taskId, long eventReminderId, String type) {
+        Intent intent = new Intent(ctx, "ALARM".equals(type) ? AlarmReceiver.class : TaskNotificationReceiver.class);
+        intent.putExtra("task_id", taskId);
+        intent.putExtra("event_reminder_id", eventReminderId);
+        return PendingIntent.getBroadcast(ctx, requestCode, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    public static synchronized void cancelForTask(Context ctx, long taskId) {
+        LocalDB db = LocalDB.getInstance(ctx);
+        AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
+        try (Cursor c = db.getReadableDatabase().rawQuery(
+                "SELECT request_code, type FROM task_alarms WHERE task_id=?", new String[]{String.valueOf(taskId)})) {
+            while (c.moveToNext()) {
+                int reqCode = c.getInt(0);
+                String type = c.getString(1);
+                Class<?> cls = "ALARM".equals(type) ? AlarmReceiver.class
+                        : "PRE_ALARM".equals(type) ? com.expenseos.receiver.PreAlarmReceiver.class
+                          : TaskNotificationReceiver.class;
+                Intent intent = new Intent(ctx, cls);
+                PendingIntent pi = PendingIntent.getBroadcast(ctx, reqCode, intent,
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                if (am != null) am.cancel(pi);
+            }
+        }
+        db.getWritableDatabase().delete("task_alarms", "task_id=?", new String[]{String.valueOf(taskId)});
+    }
+
+    private static void recordAlarm(Context ctx, long taskId, long eventReminderId, int requestCode, String triggerAt, String type) {
+        SQLiteDatabase wdb = LocalDB.getInstance(ctx).getWritableDatabase();
+        ContentValues cv = new ContentValues();
+        cv.put("id", LocalDB.getInstance(ctx).getNextId("task_alarms"));
+        cv.put("task_id", taskId);
+        cv.put("event_reminder_id", eventReminderId);
+        cv.put("request_code", requestCode);
+        cv.put("trigger_at", triggerAt);
+        cv.put("type", type);
+        wdb.insert("task_alarms", null, cv);
+    }
+
+    private static int nextRequestCode(Context ctx) {
+        // simple unique code: base offset + running counter stored via id_sequences
+        return (int) (20000 + LocalDB.getInstance(ctx).getNextId("task_alarms"));
+    }
+
+    private static com.expenseos.model.Event findEvent(EventDao dao, long eventId) {
+        for (com.expenseos.model.Event e : dao.findAll()) if (e.getId() == eventId) return e;
+        return null;
+    }
+
+    private static int scheduleType(Context ctx, long taskId, EventDao eventDao, long eventId, String type, LocalDateTime baseDate) {
+        ReminderDao reminderDao = new ReminderDao(ctx);
+        int count = 0;
+        for (EventReminder er : eventDao.findReminders(eventId, type)) {
+            com.expenseos.model.Reminder reminder = reminderDao.findById(er.getReminderId());
+            if (reminder == null) continue;
+
+            LocalDateTime trigger = baseDate.minusDays(reminder.offsetInDays())
+                    .withHour(reminder.getTimeHour()).withMinute(reminder.getTimeMinute()).withSecond(0);
+
+            if (trigger.isBefore(LocalDateTime.now())) continue;
+
+            int requestCode = nextRequestCode(ctx);
+            PendingIntent pi = buildPendingIntent(ctx, requestCode, taskId, er.getId(), type);
+
+            AlarmManager am = (AlarmManager) ctx.getSystemService(Context.ALARM_SERVICE);
+            long triggerMillis = trigger.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli();
+            boolean canExact = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || (am != null && am.canScheduleExactAlarms());
+            if (am != null) {
+                if ("ALARM".equals(type)) {
+                    // Alarm clock: no exact-alarm permission, never deferred by Doze, and the system lets
+                    // the app start its ringing service / screen when it fires — also with the screen off.
+                    Intent showI = new Intent(ctx, com.expenseos.ui.HomeActivity.class)
+                            .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                    PendingIntent showPi = PendingIntent.getActivity(ctx, requestCode + 500000, showI,
+                            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                    am.setAlarmClock(new AlarmManager.AlarmClockInfo(triggerMillis, showPi), pi);
+                } else if (canExact) {
+                    am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerMillis, pi);
+                } else {
+                    am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerMillis, pi);
+                }
+            }
+
+            recordAlarm(ctx, taskId, er.getId(), requestCode, trigger.format(TASK_FMT), type);
+            if ("ALARM".equals(type))
+                schedulePreAlarm(ctx, taskId, er.getId(), requestCode, triggerMillis, am, canExact);
+            count++;
+        }
+        return count;
+    }
+
+    /**
+     * Pre-ringing notification N minutes before an ALARM (0 = off). Tracked as type PRE_ALARM.
+     */
+    private static void schedulePreAlarm(Context ctx, long taskId, long eventReminderId, int alarmRequestCode,
+                                         long alarmMillis, AlarmManager am, boolean canExact) {
+        int mins = com.expenseos.util.AppConfig.get(ctx).getPreAlarmMinutes();
+        if (mins <= 0 || am == null) return;
+        long preMillis = alarmMillis - mins * 60_000L;
+        if (preMillis <= System.currentTimeMillis()) return; // too close / already passed
+
+        int preCode = nextRequestCode(ctx);
+        Intent i = new Intent(ctx, com.expenseos.receiver.PreAlarmReceiver.class)
+                .putExtra("task_id", taskId)
+                .putExtra("event_reminder_id", eventReminderId)
+                .putExtra("alarm_request_code", alarmRequestCode)
+                .putExtra("alarm_millis", alarmMillis)
+                .putExtra("pre_minutes", mins);
+        PendingIntent pi = PendingIntent.getBroadcast(ctx, preCode, i,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        if (canExact) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, preMillis, pi);
+        else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, preMillis, pi);
+
+        recordAlarm(ctx, taskId, eventReminderId, preCode,
+                java.time.LocalDateTime.ofInstant(java.time.Instant.ofEpochMilli(preMillis),
+                        java.time.ZoneId.systemDefault()).format(TASK_FMT), "PRE_ALARM");
+    }
+}
