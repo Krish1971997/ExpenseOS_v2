@@ -204,7 +204,6 @@
             android:launchMode="singleTask"
             android:showWhenLocked="true"
             android:turnScreenOn="true" />
-
         <receiver
             android:name=".receiver.BootReceiver"
             android:exported="true">
